@@ -1,0 +1,45 @@
+:root {
+  --bg-base:      #0d1117;
+  --bg-panel:     #161b22;
+  --bg-panel-alt: #1c2128;
+  --border:       #21262d;
+  --border-mid:   #30363d;
+  --text-primary: #e6edf3;
+  --text-muted:   #8b949e;
+  --text-faint:   #444;
+  --accent-blue:  #58a6ff;
+  --accent-gold:  #c8a923;
+  --accent-green: #3fb950;
+  --accent-amber: #d29922;
+  --panel-w:      400px;
+  --drawer-w:     440px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 13px;
+}
+
+button { font-family: inherit; font-size: inherit; cursor: pointer; }
+code   { font-family: monospace; font-size: 12px; }
+
+/* Panel slide transition */
+.panel-slide {
+  transform: translateX(var(--panel-w));
+  transition: transform 0.22s ease;
+}
+.panel-slide.open { transform: translateX(0); }
+
+/* Drawer slide transition */
+.drawer-slide {
+  transform: translateX(100%);
+  transition: transform 0.22s ease;
+}
+.drawer-slide.open { transform: translateX(0); }

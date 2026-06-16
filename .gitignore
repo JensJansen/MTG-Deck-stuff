@@ -1,0 +1,8 @@
+__pycache__/
+node_modules/
+dist/
+
+# Generated / scraped data — rebuild locally
+src/data/*.db
+src/data/cache/
+src/viz/public/data/*.json

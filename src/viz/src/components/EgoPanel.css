@@ -1,0 +1,77 @@
+/* ── Panel shell ────────────────────────────────────────── */
+.ego-panel {
+  width: var(--panel-w); flex-shrink: 0;
+  background: var(--bg-panel); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* ── Card art section ───────────────────────────────────── */
+.ego-panel__art-section { flex-shrink: 0; }
+
+.ego-panel__art { line-height: 0; }
+.ego-panel__art img { width: 100%; display: block; }
+
+.ego-panel__toggle-btn {
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  width: 100%; padding: 5px 0;
+  background: rgba(255,255,255,0.03);
+  border: none; border-bottom: 1px solid var(--border);
+  color: var(--text-faint); font-size: 11px; cursor: pointer;
+}
+.ego-panel__toggle-btn:hover { background: rgba(255,255,255,0.06); color: var(--text-muted); }
+
+/* Bottom variant: border flipped */
+.ego-panel__toggle-btn--bottom { border-top: 1px solid var(--border); border-bottom: none; }
+
+.ego-panel__toggle-chevron {
+  display: inline-block; line-height: 1;
+  transition: transform 0.25s ease;
+}
+
+.ego-panel__full-card { overflow: hidden; transition: max-height 0.3s ease; }
+.ego-panel__full-card img { width: 100%; display: block; }
+
+/* ── Header ─────────────────────────────────────────────── */
+.ego-panel__header {
+  padding: 16px 18px 12px; border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: flex-start; flex-shrink: 0;
+}
+.ego-panel__card-name { font-size: 15px; font-weight: 600; color: var(--text-primary); line-height: 1.4; }
+.ego-panel__color-label { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.ego-panel__close-btn {
+  background: none; border: none; color: var(--text-faint);
+  font-size: 20px; line-height: 1; padding: 0 2px;
+  flex-shrink: 0; margin-left: 8px; cursor: pointer;
+}
+
+/* ── Stats grid ─────────────────────────────────────────── */
+.ego-panel__stats {
+  padding: 10px 18px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px;
+}
+.stat-cell__label { color: var(--text-faint); font-size: 11px; }
+.stat-cell__value { color: var(--text-primary); font-weight: 500; }
+
+/* ── Action buttons ─────────────────────────────────────── */
+.ego-panel__btn {
+  display: block; width: calc(100% - 36px); margin: 8px 18px 0;
+  border-radius: 6px; padding: 7px 0; font-size: 12px;
+  cursor: pointer; text-align: center;
+}
+.ego-panel__btn--blue {
+  background: rgba(88,166,255,0.08); border: 1px solid rgba(88,166,255,0.25);
+  color: var(--accent-blue);
+}
+.ego-panel__btn--blue:hover { background: rgba(88,166,255,0.14); }
+.ego-panel__btn--muted {
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.14);
+  color: var(--text-primary); margin-bottom: 6px;
+}
+.ego-panel__btn--muted:hover { background: rgba(255,255,255,0.08); }
+
+/* ── Section label ──────────────────────────────────────── */
+.ego-panel__section-label {
+  padding: 6px 18px 4px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--text-faint); flex-shrink: 0;
+  border-top: 1px solid var(--border);
+}

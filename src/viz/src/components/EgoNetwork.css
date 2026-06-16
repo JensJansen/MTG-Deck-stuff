@@ -1,0 +1,10 @@
+.ego-network { flex: 1; position: relative; overflow: hidden; }
+.ego-network svg { width: 100%; height: 100%; }
+
+.ego-network__tooltip {
+  position: fixed; pointer-events: none; display: none;
+  background: rgba(13,17,23,0.95); border: 1px solid var(--border-mid);
+  border-radius: 6px; padding: 7px 11px;
+  font-size: 12px; line-height: 1.7; color: var(--text-primary);
+  z-index: 20; max-width: 200px;
+}

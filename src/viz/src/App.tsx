@@ -1,0 +1,208 @@
+import { useState, useMemo, useRef } from 'react';
+import { COLOR_HEX, COLOR_LABEL, COLOR_ORDER } from './constants';
+import { useManifest, useGraphData } from './hooks/useGraphData';
+import { useGraphFocus } from './hooks/useGraphFocus';
+import { FormatSelector } from './components/FormatSelector';
+import { ForceGraph } from './components/ForceGraph';
+import { FocusGraph } from './components/FocusGraph';
+import { EgoPanel } from './components/EgoPanel';
+import { StatsDrawer } from './components/StatsDrawer';
+import type { ColorCat } from './types';
+import './App.css';
+
+export function App() {
+  const { formats, loading: manifestLoading } = useManifest();
+
+  const [selectedFormat, setSelectedFormat]   = useState<string | null>(null);
+  const [selectedNodeIdx, setSelectedNodeIdx] = useState<number | null>(null);
+  const [drawerOpen, setDrawerOpen]           = useState(false);
+  const [searchQuery, setSearchQuery]         = useState('');
+  const [selectedColors, setSelectedColors]   = useState<Set<string>>(new Set());
+  const [colorMode, setColorMode]             = useState<'including' | 'exactly'>('including');
+
+  const { data, loading: dataLoading, error } = useGraphData(selectedFormat);
+
+  const { focusedNode, isFocused, focusGraphData, applyFocus, resetFocus } =
+    useGraphFocus(data?.nodes ?? [], data?.edges ?? [], selectedFormat, data?.ego ?? {}, selectedColors, colorMode);
+
+  const [focusPill, setFocusPill] = useState(false);
+  const pillTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function showFocusPill() {
+    if (pillTimer.current) clearTimeout(pillTimer.current);
+    setFocusPill(true);
+    pillTimer.current = setTimeout(() => setFocusPill(false), 5000);
+  }
+
+  const nameIndex = useMemo<Record<string, number>>(() => {
+    if (!data) return {};
+    const idx: Record<string, number> = {};
+    data.nodes.forEach((n, i) => { idx[n.name] = i; });
+    return idx;
+  }, [data]);
+
+  const highlightedIndices = useMemo<number[] | null>(() => {
+    if (!searchQuery || !data) return null;
+    const q = searchQuery.toLowerCase();
+    return data.nodes.reduce<number[]>((acc, n, i) => {
+      if (n.name.toLowerCase().includes(q)) acc.push(i);
+      return acc;
+    }, []);
+  }, [searchQuery, data]);
+
+  const selectedNode = selectedNodeIdx !== null && data ? data.nodes[selectedNodeIdx] : null;
+  const partners     = selectedNode ? (data?.ego[selectedNode.name] ?? []) : [];
+
+  function toggleColor(cat: string) {
+    setSelectedColors(prev => { const next = new Set(prev); if (next.has(cat)) next.delete(cat); else next.add(cat); return next; });
+  }
+
+  function handleNodeClick(idx: number)   { setSelectedNodeIdx(idx); setDrawerOpen(false); }
+  function handlePanelClose()             { setSelectedNodeIdx(null); setDrawerOpen(false); }
+  function handlePartnerClick(name: string) {
+    const idx = nameIndex[name];
+    if (idx !== undefined) { setSelectedNodeIdx(idx); setDrawerOpen(false); }
+  }
+  function handleFormatSelect(fmt: string) {
+    setSelectedFormat(fmt); setSelectedNodeIdx(null); setDrawerOpen(false);
+    setSearchQuery(''); setSelectedColors(new Set()); setColorMode('including');
+    resetFocus();
+  }
+
+  // ── Format selector screen ────────────────────────────────────────────────
+  if (!selectedFormat) {
+    return (
+      <div style={{ width: '100%', height: '100%' }}>
+        {manifestLoading ? <LoadingScreen label="Loading..." /> : <FormatSelector formats={formats} onSelect={handleFormatSelect} />}
+      </div>
+    );
+  }
+
+  // ── Loading / error ───────────────────────────────────────────────────────
+  if (dataLoading) return <LoadingScreen label={`Loading ${selectedFormat}...`} />;
+  if (error || !data) {
+    return (
+      <LoadingScreen label={error ?? 'Failed to load data'}>
+        <button className="loading-back-btn" onClick={() => setSelectedFormat(null)}>Back</button>
+      </LoadingScreen>
+    );
+  }
+
+  // ── Main visualization ────────────────────────────────────────────────────
+  const presentColors = new Set(data.nodes.map(n => n.color_cat));
+
+  return (
+    <div className="app-root">
+      <div className="app-main">
+
+        {/* Main graph */}
+        {isFocused && focusGraphData ? (
+          <FocusGraph key={focusGraphData.focusNodeId} data={focusGraphData} allNodes={data.nodes} onNodeClick={handleNodeClick} />
+        ) : (
+          <ForceGraph nodes={data.nodes} edges={data.edges} highlightedIndices={highlightedIndices}
+            onNodeClick={handleNodeClick} selectedColors={selectedColors} colorMode={colorMode} />
+        )}
+
+        {/* Search — hidden in focus mode */}
+        {!isFocused && (
+          <div className="search-bar">
+            <input className="search-input" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+              placeholder="Search card..." autoComplete="off" spellCheck={false} />
+            {searchQuery && <span className="search-clear" onClick={() => setSearchQuery('')}>×</span>}
+          </div>
+        )}
+
+        {/* Color filter */}
+        <div className="color-filter">
+          <div className="color-filter__header">
+            <span>Color filter</span>
+            {selectedColors.size > 0 && (
+              <button className="color-filter__clear" onClick={() => setSelectedColors(new Set())} title="Clear color filter">×</button>
+            )}
+          </div>
+          <div className="color-filter__pips">
+            {COLOR_ORDER.filter(cat => cat !== 'Multi').map(cat => {
+              const active    = selectedColors.has(cat);
+              const label     = cat === 'Colorless' ? 'ø' : cat;
+              const textColor = active ? (cat === 'W' || cat === 'Colorless' ? '#1a1a1a' : '#ffffff') : COLOR_HEX[cat as ColorCat];
+              return (
+                <button key={cat} className="color-filter__pip" onClick={() => toggleColor(cat)} title={COLOR_LABEL[cat as ColorCat]}
+                  style={{
+                    background: active ? COLOR_HEX[cat as ColorCat] : 'transparent',
+                    border:     `2px solid ${COLOR_HEX[cat as ColorCat]}`,
+                    boxShadow:  active ? '0 0 0 2px #ffffff' : 'none',
+                    opacity:    active ? 1 : 0.55,
+                    color:      textColor,
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          {selectedColors.size > 0 && (
+            <div className="color-filter__modes">
+              {(['including', 'exactly'] as const).map(mode => (
+                <label key={mode} className="color-filter__mode-label"
+                  style={{ color: colorMode === mode ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+                  <input type="radio" name="colorMode" checked={colorMode === mode} onChange={() => setColorMode(mode)}
+                    style={{ margin: 0, cursor: 'pointer', accentColor: 'var(--accent-blue)' }} />
+                  {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Focus mode badge */}
+        {isFocused && focusedNode && (
+          <div className="focus-badge">
+            <span>Focused:</span>
+            <span className="focus-badge__name">{focusedNode.name}</span>
+            <button className="focus-badge__reset" onClick={resetFocus}>Reset view</button>
+          </div>
+        )}
+
+        {/* Legend */}
+        <div className="legend" style={{ right: drawerOpen ? 'calc(var(--drawer-w) - var(--panel-w) + 14px)' : 14 }}>
+          {COLOR_ORDER.filter(cat => presentColors.has(cat)).map(cat => (
+            <div key={cat} className="legend__item">
+              <span className="legend__dot" style={{ background: COLOR_HEX[cat as ColorCat] }} />
+              {COLOR_LABEL[cat as ColorCat]}
+            </div>
+          ))}
+        </div>
+
+        {/* Bottom bar */}
+        <div className="bottom-bar">
+          <span>{data.nodes.length.toLocaleString()} cards &nbsp;·&nbsp; {selectedFormat}</span>
+          <button className="bottom-bar__back" onClick={() => setSelectedFormat(null)}>← formats</button>
+        </div>
+        <div className="bottom-hint">Scroll: zoom &nbsp;·&nbsp; Drag: pan &nbsp;·&nbsp; Click: inspect</div>
+      </div>
+
+      {/* Right panel */}
+      <EgoPanel node={selectedNode} partners={partners} nameIndex={nameIndex} nodes={data.nodes}
+        onClose={handlePanelClose}
+        onRefocus={() => { if (selectedNodeIdx !== null) { showFocusPill(); applyFocus(selectedNodeIdx).catch(console.error); } }}
+        onViewStats={() => setDrawerOpen(true)}
+        onNodeClick={handlePartnerClick}
+      />
+
+      {/* Focus loading toast */}
+      {focusPill && <div className="focus-toast">Loading focus view…</div>}
+
+      {/* Stats drawer */}
+      <StatsDrawer open={drawerOpen} node={selectedNode} partners={partners}
+        onClose={() => setDrawerOpen(false)} onNodeClick={handlePartnerClick} />
+    </div>
+  );
+}
+
+function LoadingScreen({ label, children }: { label: string; children?: React.ReactNode }) {
+  return (
+    <div className="loading-screen">
+      <span>{label}</span>
+      {children}
+    </div>
+  );
+}

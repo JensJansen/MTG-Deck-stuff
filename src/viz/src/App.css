@@ -1,0 +1,98 @@
+/* ── App shell ─────────────────────────────────────────── */
+.app-root { display: flex; width: 100%; height: 100%; position: relative; }
+.app-main { flex: 1; position: relative; min-width: 0; }
+
+/* ── Search bar ─────────────────────────────────────────── */
+.search-bar {
+  position: absolute; top: 14px; left: 14px; z-index: 10;
+  display: flex; align-items: center; gap: 8px;
+  width: 230px;
+}
+.search-input {
+  flex: 1; min-width: 0;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.18);
+  color: #e0e0e0; border-radius: 6px;
+  padding: 6px 12px; font-size: 13px; outline: none;
+}
+.search-clear { color: var(--text-faint); cursor: pointer; font-size: 18px; line-height: 1; }
+
+/* ── Color filter ───────────────────────────────────────── */
+.color-filter {
+  position: absolute; top: 60px; left: 14px; z-index: 10;
+  background: rgba(22,27,34,0.95);
+  border: 1px solid var(--border-mid);
+  border-radius: 8px; overflow: hidden;
+  width: 230px;
+}
+.color-filter__header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; border-bottom: 1px solid var(--border);
+  font-size: 11px; color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.color-filter__clear {
+  background: none; border: none; color: var(--text-muted);
+  cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px;
+}
+.color-filter__pips { display: flex; gap: 7px; padding: 8px 10px; align-items: center; }
+.color-filter__pip {
+  width: 26px; height: 26px; border-radius: 50%;
+  cursor: pointer; padding: 0;
+  font-size: 10px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity 0.15s, box-shadow 0.15s;
+  flex-shrink: 0;
+}
+.color-filter__modes { display: flex; padding: 0 10px 8px; }
+.color-filter__mode-label {
+  display: flex; align-items: center; gap: 5px; margin-right: 14px;
+  cursor: pointer; user-select: none; font-size: 12px;
+}
+
+/* ── Focus mode badge ───────────────────────────────────── */
+.focus-badge {
+  position: absolute; top: 14px; left: 14px; z-index: 10;
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(200,169,35,0.12); border: 1px solid rgba(200,169,35,0.35);
+  border-radius: 6px; padding: 5px 10px;
+  font-size: 12px; color: var(--accent-gold);
+}
+.focus-badge__name {
+  font-weight: 500; max-width: 160px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.focus-badge__reset {
+  background: rgba(200,169,35,0.2); border: 1px solid rgba(200,169,35,0.4);
+  color: var(--accent-gold); border-radius: 4px;
+  padding: 3px 8px; font-size: 11px; white-space: nowrap; cursor: pointer;
+}
+
+/* ── Legend ─────────────────────────────────────────────── */
+.legend {
+  position: absolute; top: 14px; z-index: 10;
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px; padding: 10px 16px;
+  font-size: 12px; line-height: 2.1;
+  transition: right 0.22s ease;
+}
+.legend__item { display: flex; align-items: center; }
+.legend__dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 7px; flex-shrink: 0; }
+
+/* ── Bottom bar ─────────────────────────────────────────── */
+.bottom-bar { position: absolute; bottom: 12px; left: 14px; font-size: 12px; color: var(--text-faint); z-index: 10; display: flex; gap: 16px; }
+.bottom-bar__back { background: none; border: none; color: var(--text-faint); padding: 0; cursor: pointer; font-size: 12px; }
+.bottom-hint { position: absolute; bottom: 12px; right: 14px; font-size: 11px; color: #333; z-index: 10; }
+
+/* ── Loading toast (focus view) ─────────────────────────── */
+.focus-toast {
+  position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+  z-index: 200; background: rgba(22,27,34,0.92);
+  border: 1px solid rgba(255,255,255,0.12); border-radius: 20px;
+  padding: 7px 18px; font-size: 12px; color: var(--text-muted);
+  pointer-events: none; white-space: nowrap;
+}
+
+/* ── Loading / error screen ─────────────────────────────── */
+.loading-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-muted); gap: 8px; }
+.loading-back-btn { margin-top: 16px; background: none; border: 1px solid var(--border-mid); color: var(--text-muted); border-radius: 6px; padding: 6px 16px; cursor: pointer; }
