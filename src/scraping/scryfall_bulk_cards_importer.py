@@ -3,11 +3,11 @@ Download all MTG cards from Scryfall's bulk-data endpoint and store them
 in a local SQLite database (cards.db).  Completely separate from decks.db.
 
 Usage:
-    python src/scraping/cards_db.py                        # oracle_cards (~27k unique cards)
-    python src/scraping/cards_db.py --bulk all_cards       # every printing (~110k+)
-    python src/scraping/cards_db.py --cache                # save raw JSON to disk; reuse on next run
-    python src/scraping/cards_db.py --db path/to/custom.db
-    python src/scraping/cards_db.py --info                 # show DB stats only, no download
+    python src/scraping/scryfall_bulk_cards_importer.py                        # oracle_cards (~27k unique cards)
+    python src/scraping/scryfall_bulk_cards_importer.py --bulk all_cards       # every printing (~110k+)
+    python src/scraping/scryfall_bulk_cards_importer.py --cache                # save raw JSON to disk; reuse on next run
+    python src/scraping/scryfall_bulk_cards_importer.py --db path/to/custom.db
+    python src/scraping/scryfall_bulk_cards_importer.py --info                 # show DB stats only, no download
 """
 
 import argparse
@@ -16,30 +16,11 @@ import sqlite3
 import time
 from pathlib import Path
 
+from constants import COLOR_BITS, LEGAL_FORMATS, encode_colors
 from scryfall import ScryfallClient
 
 DB_PATH   = Path(__file__).parents[1] / "data" / "cards.db"
 CACHE_DIR = Path(__file__).parents[1] / "data" / "cache"
-
-COLOR_BITS = {"W": 1, "U": 2, "B": 4, "R": 8, "G": 16}
-
-# All formats Scryfall includes in the legalities dict.
-LEGAL_FORMATS = [
-    "standard", "future", "historic", "timeless", "gladiator",
-    "pioneer", "explorer", "modern", "legacy", "pauper", "vintage",
-    "penny", "commander", "oathbreaker", "standardbrawl", "brawl",
-    "alchemy", "paupercommander", "duel", "oldschool", "premodern",
-    "predh", "historicbrawl",
-]
-
-
-def encode_colors(colors) -> int:
-    if isinstance(colors, str):
-        colors = [c.strip() for c in colors.split(",") if c.strip()]
-    mask = 0
-    for c in (colors or []):
-        mask |= COLOR_BITS.get(str(c).strip().upper(), 0)
-    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -322,10 +303,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python src/scraping/cards_db.py                         # oracle_cards (~27k unique cards)
-  python src/scraping/cards_db.py --bulk all_cards        # every printing (~110k+)
-  python src/scraping/cards_db.py --cache                 # cache JSON; reuse on subsequent runs
-  python src/scraping/cards_db.py --info                  # show DB stats without downloading
+  python src/scraping/scryfall_bulk_cards_importer.py                         # oracle_cards (~27k unique cards)
+  python src/scraping/scryfall_bulk_cards_importer.py --bulk all_cards        # every printing (~110k+)
+  python src/scraping/scryfall_bulk_cards_importer.py --cache                 # cache JSON; reuse on subsequent runs
+  python src/scraping/scryfall_bulk_cards_importer.py --info                  # show DB stats without downloading
 """,
     )
     parser.add_argument(
@@ -372,13 +353,11 @@ Examples:
     t1 = time.perf_counter()
     ok, errors = import_cards(cards, conn)
     t_import = time.perf_counter() - t1
-    conn.close()
 
     print(f"Done: {ok:,} upserted, {errors} errors in {t_import:.1f}s  ->  {db_path}")
     print()
-    conn2 = sqlite3.connect(db_path)
-    print_db_stats(conn2)
-    conn2.close()
+    print_db_stats(conn)
+    conn.close()
 
 
 if __name__ == "__main__":

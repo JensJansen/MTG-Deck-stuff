@@ -1,12 +1,14 @@
 """
 scraper_node.py - Claim batches of discovered decks and fetch their card lists.
 
-Multiple instances can run on different machines simultaneously.  Each node
-atomically claims a batch of 'discovered' decks using SELECT FOR UPDATE SKIP
-LOCKED so two nodes never process the same deck.
+Multiple instances can run on different machines simultaneously. Each node
+requests a batch of unclaimed decks from the API, fetches their card contents
+from Moxfield, and submits the results back through the API. No direct database
+access is required.
 
 Decks that have been claimed but not finished within CLAIM_TIMEOUT_MINUTES are
-eligible for reclaiming (handles node crashes / network failures).
+automatically eligible for reclaiming by another node (handles crashes /
+network failures).
 
 Usage:
     python "src/distributed scraper/scraper_node.py"
@@ -15,125 +17,74 @@ Usage:
     python "src/distributed scraper/scraper_node.py" --worker-id my-node-1
 
 Environment:
-    DATABASE_URL  PostgreSQL connection string (required)
+    SCRAPER_API_URL   Base URL of the scraper API (default: http://localhost:8000)
+    API_KEY           Shared API key for authentication (required)
 """
 
 import argparse
-import socket
 import os
+import socket
 import time
-from datetime import datetime, timezone
 
 import requests
 
 from config import (
     API_DECK,
     BOARDS,
-    CLAIM_TIMEOUT_MINUTES,
     DEFAULT_BATCH_SIZE,
-    HEADERS,
+    HEADERS as MOXFIELD_HEADERS,
     RATE_LIMIT_SECONDS,
+    SCRAPER_API_KEY,
+    SCRAPER_API_URL,
 )
-from db import apply_schema, get_connection
+
+_API_HEADERS = {"X-Api-Key": SCRAPER_API_KEY}
 
 
 # ---------------------------------------------------------------------------
-# Claiming
+# Scraper API helpers
 # ---------------------------------------------------------------------------
 
-def claim_batch(conn, batch_size: int, worker_id: str) -> list[str]:
+def api_claim_batch(batch_size: int, worker_id: str) -> list[dict]:
+    """Request a batch of unclaimed decks from the API. Returns list of deck objects."""
+    resp = requests.post(
+        f"{SCRAPER_API_URL}/decks/batch",
+        headers=_API_HEADERS,
+        json={"batch_size": batch_size, "worker_id": worker_id},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_submit_cards(public_id: str, worker_id: str, cards: list[dict]) -> int:
     """
-    Atomically claim up to batch_size 'discovered' decks (or stale 'claimed'
-    decks whose claim has timed out).  Returns the list of claimed public_ids.
+    Submit card rows for a processed deck.
+    Returns the number of rows written, or -1 if the deck was already done (collision).
     """
-    with conn.cursor() as cur:
-        cur.execute("""
-            UPDATE decks
-            SET    status     = 'claimed',
-                   claimed_at = NOW(),
-                   claimed_by = %s
-            WHERE  public_id IN (
-                SELECT public_id
-                FROM   decks
-                WHERE  status = 'discovered'
-                   OR  (
-                           status     = 'claimed'
-                       AND claimed_at < NOW() - (%s * INTERVAL '1 minute')
-                   )
-                ORDER  BY scraped_at
-                LIMIT  %s
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING public_id
-        """, (worker_id, CLAIM_TIMEOUT_MINUTES, batch_size))
-        conn.commit()
-        return [row[0] for row in cur.fetchall()]
+    resp = requests.post(
+        f"{SCRAPER_API_URL}/decks/{public_id}/cards",
+        headers=_API_HEADERS,
+        json={"worker_id": worker_id, "cards": cards},
+        timeout=30,
+    )
+    if resp.status_code == 409:
+        return -1
+    resp.raise_for_status()
+    return resp.json()["rows_written"]
 
 
-# ---------------------------------------------------------------------------
-# Card resolution
-# ---------------------------------------------------------------------------
-
-def resolve_card_names(conn, names: list[str]) -> dict[str, int]:
-    """Return {card_name: id} for all names that exist in the cards table."""
-    if not names:
-        return {}
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT card_name, id FROM cards WHERE card_name = ANY(%s)",
-            (names,),
+def api_report_error(public_id: str, worker_id: str, detail: str) -> None:
+    """Mark a deck as errored. Best-effort; ignores failures."""
+    try:
+        requests.post(
+            f"{SCRAPER_API_URL}/decks/{public_id}/error",
+            headers=_API_HEADERS,
+            json={"worker_id": worker_id, "detail": detail},
+            timeout=10,
         )
-        return {row[0]: row[1] for row in cur.fetchall()}
-
-
-# ---------------------------------------------------------------------------
-# Database writes
-# ---------------------------------------------------------------------------
-
-def replace_deck_cards(conn, deck_id: str, deck_card_rows: list[dict]) -> int:
-    """
-    Delete existing card rows for the deck and insert the new ones.
-    Returns the number of rows written.
-    """
-    if not deck_card_rows:
-        return 0
-
-    names = list({r["card_name"] for r in deck_card_rows})
-    name_to_id = resolve_card_names(conn, names)
-
-    for name in names:
-        if name not in name_to_id:
-            print(f"    [warn] card not in DB, skipping: {name!r}")
-
-    rows = [
-        (deck_id, name_to_id[r["card_name"]], r["board"], r["quantity"])
-        for r in deck_card_rows
-        if r["card_name"] in name_to_id
-    ]
-
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM deck_cards WHERE deck_id = %s", (deck_id,))
-        if rows:
-            cur.executemany(
-                "INSERT INTO deck_cards (deck_id, card_id, board, quantity) VALUES (%s, %s, %s, %s)",
-                rows,
-            )
-        cur.execute(
-            "UPDATE decks SET status = 'done', cards_fetched_at = %s WHERE public_id = %s",
-            (datetime.now(timezone.utc).isoformat(), deck_id),
-        )
-
-    conn.commit()
-    return len(rows)
-
-
-def mark_error(conn, deck_id: str) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE decks SET status = 'error' WHERE public_id = %s",
-            (deck_id,),
-        )
-    conn.commit()
+    except requests.RequestException:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +93,7 @@ def mark_error(conn, deck_id: str) -> None:
 
 def fetch_deck_detail(public_id: str) -> dict:
     url  = API_DECK.format(public_id=public_id)
-    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp = requests.get(url, headers=MOXFIELD_HEADERS, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
@@ -167,76 +118,87 @@ def parse_deck_detail(detail: dict) -> list[dict]:
 # Processing loop
 # ---------------------------------------------------------------------------
 
-def process_batch(conn, deck_ids: list[str]) -> tuple[int, int]:
-    """Process a batch of claimed decks.  Returns (done, errors)."""
-    done   = 0
-    errors = 0
+def process_batch(decks: list[dict], worker_id: str) -> tuple[int, int, int]:
+    """Process a claimed batch. Returns (done, collisions, errors)."""
+    done       = 0
+    collisions = 0
+    errors     = 0
 
-    for i, deck_id in enumerate(deck_ids):
+    for i, deck in enumerate(decks):
+        public_id = deck["public_id"]
         if i > 0:
             time.sleep(RATE_LIMIT_SECONDS)
 
-        print(f"  [{i + 1}/{len(deck_ids)}] {deck_id}", end=" ... ", flush=True)
+        print(f"  [{i + 1}/{len(decks)}] {public_id}", end=" ... ", flush=True)
         try:
-            detail         = fetch_deck_detail(deck_id)
+            detail         = fetch_deck_detail(public_id)
             deck_card_rows = parse_deck_detail(detail)
-            n              = replace_deck_cards(conn, deck_id, deck_card_rows)
-            print(f"done ({n} card-rows)")
-            done += 1
+            n              = api_submit_cards(public_id, worker_id, deck_card_rows)
+            if n == -1:
+                print("collision — deck already processed")
+                collisions += 1
+            else:
+                print(f"done ({n} card-rows)")
+                done += 1
         except requests.HTTPError as exc:
             code = exc.response.status_code
             print(f"HTTP {code} — marking error")
-            mark_error(conn, deck_id)
+            api_report_error(public_id, worker_id, f"HTTP {code}")
             errors += 1
         except requests.RequestException as exc:
             print(f"request failed ({exc}) — marking error")
-            mark_error(conn, deck_id)
+            api_report_error(public_id, worker_id, str(exc))
             errors += 1
 
-    return done, errors
+    return done, collisions, errors
 
 
-def run_loop(conn, batch_size: int, worker_id: str, once: bool, delay: float) -> None:
+def run_loop(batch_size: int, worker_id: str, once: bool, delay: float) -> None:
     print(f"Scraper node '{worker_id}' starting  (batch_size={batch_size})")
 
-    total_done   = 0
-    total_errors = 0
+    total_done       = 0
+    total_collisions = 0
+    total_errors     = 0
 
     while True:
-        deck_ids = claim_batch(conn, batch_size, worker_id)
-
-        if not deck_ids:
-            if once:
-                print("No discoverable decks — exiting.")
-                break
-            print(f"No discoverable decks — sleeping {delay:.0f}s ...", flush=True)
+        try:
+            decks = api_claim_batch(batch_size, worker_id)
+        except requests.RequestException as exc:
+            print(f"[error] Failed to claim batch: {exc}. Sleeping {delay:.0f}s ...")
             time.sleep(delay)
             continue
 
-        print(f"\nClaimed {len(deck_ids)} deck(s):")
-        done, errors = process_batch(conn, deck_ids)
-        total_done   += done
-        total_errors += errors
-        print(f"  Batch done: {done} ok, {errors} errors  "
-              f"(total: {total_done} ok, {total_errors} errors)")
+        if not decks:
+            print("No claimable decks — exiting.")
+            break
+
+        print(f"\nClaimed {len(decks)} deck(s):")
+        done, collisions, errors = process_batch(decks, worker_id)
+        total_done       += done
+        total_collisions += collisions
+        total_errors     += errors
+        print(
+            f"  Batch done: {done} ok, {collisions} collision(s), {errors} error(s)  "
+            f"(total: {total_done} ok, {total_collisions} collision(s), {total_errors} error(s))"
+        )
 
         if once:
             break
 
-    print(f"\nFinished. {total_done} decks processed, {total_errors} errors.")
+    print(f"\nFinished. {total_done} processed, {total_collisions} collision(s), {total_errors} error(s).")
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def default_worker_id() -> str:
+def _default_worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Scraper node: claim and process discovered decks from Postgres.",
+        description="Scraper node: claim and process discovered decks via the API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -248,15 +210,15 @@ Examples:
     )
     parser.add_argument(
         "--batch-size", dest="batch_size", type=int, default=DEFAULT_BATCH_SIZE,
-        help=f"Number of decks to claim per batch (default: {DEFAULT_BATCH_SIZE})",
+        help=f"Decks to claim per batch (default: {DEFAULT_BATCH_SIZE})",
     )
     parser.add_argument(
         "--worker-id", dest="worker_id", default=None,
-        help="Identifier for this node stored in the DB (default: hostname:pid)",
+        help="Identifier stored with claimed decks (default: hostname:pid)",
     )
     parser.add_argument(
         "--once", dest="once", action="store_true",
-        help="Process one batch then exit (default: loop until no work remains)",
+        help="Process one batch then exit",
     )
     parser.add_argument(
         "--delay", dest="delay", type=float, default=30.0,
@@ -264,15 +226,7 @@ Examples:
     )
     args = parser.parse_args()
 
-    worker_id = args.worker_id or default_worker_id()
-
-    conn = get_connection()
-    apply_schema(conn)
-
-    try:
-        run_loop(conn, args.batch_size, worker_id, args.once, args.delay)
-    finally:
-        conn.close()
+    run_loop(args.batch_size, args.worker_id or _default_worker_id(), args.once, args.delay)
 
 
 if __name__ == "__main__":

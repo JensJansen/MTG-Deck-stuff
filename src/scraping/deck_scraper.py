@@ -6,11 +6,20 @@ to decide which cards to search for, then hits Moxfield's per-card search
 endpoint for each one (up to the 100-page API limit). Decks already stored
 and unchanged are skipped.
 
+By default runs in incremental mode: pages are fetched newest-first and
+pagination stops for a card as soon as any deck on a page already has cards
+stored in the DB (meaning we've caught up to previously scraped data).
+Pass --full-sweep to disable this and fetch all pages regardless.
+
+Note: --skip-cards disables card fetching, so incremental mode cannot detect
+already-scraped decks. Combining --skip-cards with incremental mode behaves
+identically to --full-sweep.
+
 Usage:
     python src/scraping/deck_scraper.py --card "Lightning Bolt"
     python src/scraping/deck_scraper.py --format pauper
     python src/scraping/deck_scraper.py
-    python src/scraping/deck_scraper.py --early-stop
+    python src/scraping/deck_scraper.py --full-sweep
     python src/scraping/deck_scraper.py --format commander --skip-cards
 """
 
@@ -21,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+
+from constants import COLOR_BITS, LEGAL_FORMATS, encode_colors
 
 # ---------------------------------------------------------------------------
 # Config
@@ -34,36 +45,12 @@ HEADERS = {
 }
 RATE_LIMIT_SECONDS = 1.0
 
-# Scryfall format names — these correspond to legal_<fmt> columns in cards table.
-LEGAL_FORMATS = [
-    "standard", "future", "historic", "timeless", "gladiator",
-    "pioneer", "explorer", "modern", "legacy", "pauper", "vintage",
-    "penny", "commander", "oathbreaker", "standardbrawl", "brawl",
-    "alchemy", "paupercommander", "duel", "oldschool", "premodern",
-    "predh", "historicbrawl",
-]
-
 BOARDS = [
     "commanders", "companions", "signatureSpells",
     "mainboard", "sideboard", "maybeboard", "attractions", "stickers",
 ]
 
 DB_PATH = Path(__file__).parents[1] / "data" / "decks.db"
-
-# ---------------------------------------------------------------------------
-# Color bitmask
-# ---------------------------------------------------------------------------
-
-COLOR_BITS = {"W": 1, "U": 2, "B": 4, "R": 8, "G": 16}
-
-
-def encode_colors(colors) -> int:
-    if isinstance(colors, str):
-        colors = [c.strip() for c in colors.split(",")]
-    mask = 0
-    for c in (colors or []):
-        mask |= COLOR_BITS.get(c.strip().upper(), 0)
-    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +153,20 @@ def replace_deck_cards(
     )
 
 
+def _decks_with_cards(conn: sqlite3.Connection, public_ids: list[str]) -> set[str]:
+    """Return the subset of public_ids that already have card rows in deck_cards."""
+    if not public_ids:
+        return set()
+    placeholders = ",".join("?" * len(public_ids))
+    return {
+        row[0]
+        for row in conn.execute(
+            f"SELECT DISTINCT deck_id FROM deck_cards WHERE deck_id IN ({placeholders})",
+            public_ids,
+        )
+    }
+
+
 # ---------------------------------------------------------------------------
 # Card selection
 # ---------------------------------------------------------------------------
@@ -210,8 +211,8 @@ def fetch_page(
     params: dict = {
         "pageNumber":    page,
         "pageSize":      page_size,
-        "sortType":      "updated",
-        "sortDirection": "Descending",
+        "sortType":      "created",
+        "sortDirection": "descending",
     }
     if fmt:
         params["fmt"] = fmt
@@ -302,12 +303,17 @@ def _sweep_one_card(
     fmt: str | None,
     page_size: int,
     fetch_cards: bool,
-    early_stop: bool,
+    full_sweep: bool,
 ) -> tuple[int, int]:
     """
     Paginate through all Moxfield decks containing card_name (filtered by fmt if given).
     Returns (new_decks_saved, pages_fetched).
     """
+    # Incremental mode requires card rows to detect already-scraped decks.
+    # If card fetching is disabled there is nothing to check against, so
+    # fall back to full-sweep behaviour automatically.
+    effective_full_sweep = full_sweep or not fetch_cards
+
     search_name = moxfield_search_name(card_name)
     new_decks = 0
     page = 1
@@ -329,17 +335,19 @@ def _sweep_one_card(
         total_pages = data.get("totalPages", 1)
         print(f"    page {page}/{total_pages} ...", end=" ", flush=True)
 
-        page_new = 0
-        for raw in raw_decks:
-            deck = parse_deck(raw, fmt)
-            if not deck["public_id"]:
-                continue
-            upsert_deck(conn, deck)
-            if not conn.execute(
-                "SELECT 1 FROM deck_cards WHERE deck_id = ?", (deck["public_id"],)
-            ).fetchone():
-                page_new += 1
+        # Parse all decks on this page once, filtering out entries with no ID.
+        parsed_page = [d for raw in raw_decks if (d := parse_deck(raw, fmt))["public_id"]]
 
+        # One batch query to find which of these already have card rows.
+        has_cards = (
+            set() if effective_full_sweep
+            else _decks_with_cards(conn, [d["public_id"] for d in parsed_page])
+        )
+
+        page_new = sum(1 for d in parsed_page if d["public_id"] not in has_cards)
+
+        for deck in parsed_page:
+            upsert_deck(conn, deck)
         conn.commit()
 
         if fetch_cards:
@@ -354,7 +362,7 @@ def _sweep_one_card(
         if page >= total_pages or len(raw_decks) < page_size:
             break
 
-        if early_stop and page_new == 0:
+        if not effective_full_sweep and page_new < len(parsed_page):
             break
 
         page += 1
@@ -370,11 +378,12 @@ def sweep(
     fmt: str | None,
     page_size: int,
     fetch_cards: bool,
-    early_stop: bool,
+    full_sweep: bool,
 ) -> None:
     n = len(card_names)
     fmt_label = fmt or "all formats"
-    print(f"Sweeping {n} card(s) [{fmt_label}]  early_stop={'on' if early_stop else 'off'}")
+    mode = "full" if (full_sweep or not fetch_cards) else "incremental"
+    print(f"Sweeping {n} card(s) [{fmt_label}]  mode={mode}")
 
     total_new_decks = 0
     w = len(str(n))
@@ -382,7 +391,7 @@ def sweep(
     for idx, card_name in enumerate(card_names, 1):
         print(f"\n  [{idx:>{w}}/{n}] {card_name}", flush=True)
         new_decks, pages = _sweep_one_card(
-            conn, card_name, fmt, page_size, fetch_cards, early_stop
+            conn, card_name, fmt, page_size, fetch_cards, full_sweep
         )
         total_new_decks += new_decks
         if new_decks:
@@ -410,7 +419,7 @@ Modes (mutually exclusive):
 Examples:
   python src/scraping/deck_scraper.py --card "Lightning Bolt"
   python src/scraping/deck_scraper.py --format pauper
-  python src/scraping/deck_scraper.py --format commander --early-stop
+  python src/scraping/deck_scraper.py --format commander --full-sweep
   python src/scraping/deck_scraper.py --skip-cards
 """,
     )
@@ -426,8 +435,8 @@ Examples:
                         help="Decks per API page (default: 100)")
     parser.add_argument("--skip-cards", dest="skip_cards", action="store_true",
                         help="Store deck metadata only; skip fetching card contents")
-    parser.add_argument("--early-stop", dest="early_stop", action="store_true",
-                        help="Stop paginating a card once a full page is all already-seen decks")
+    parser.add_argument("--full-sweep", dest="full_sweep", action="store_true",
+                        help="Fetch all pages for every card, ignoring already-scraped decks")
     parser.add_argument("--db", dest="db_path", default=str(DB_PATH),
                         help=f"SQLite database path (default: {DB_PATH})")
 
@@ -452,7 +461,7 @@ Examples:
             fmt=args.format,
             page_size=args.page_size,
             fetch_cards=not args.skip_cards,
-            early_stop=args.early_stop,
+            full_sweep=args.full_sweep,
         )
     finally:
         conn.close()

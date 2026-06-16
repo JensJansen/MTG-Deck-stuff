@@ -1,0 +1,13 @@
+app            = "deck-gen-scraper"
+primary_region = "iad"
+
+[build]
+
+[env]
+  SCRAPER_API_URL = "http://100.113.155.84:8000"
+  ALL_PROXY       = "socks5h://127.0.0.1:1055"
+
+[[vm]]
+  memory   = "256mb"
+  cpu_kind = "shared"
+  cpus     = 1

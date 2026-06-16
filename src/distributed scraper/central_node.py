@@ -1,21 +1,24 @@
 """
-central_node.py - Discover Moxfield decks and record them in the shared database.
+central_node.py - Discover Moxfield decks and record them via the scraper API.
 
-This node only discovers decks (stores public_id + metadata) and never fetches
-card contents. Scraper nodes handle card fetching separately.
+This node paginates through Moxfield search results for each card in the
+shared card catalogue, posting discovered decks to the API server. It never
+writes to the database directly.
 
-The card list used to drive searches is read from the shared Postgres cards
-table (seeded by seed_cards.py). Run seed_cards.py at least once before
-starting the central node.
+By default runs in incremental mode: pages are fetched newest-first and
+pagination stops for a card as soon as any deck on a page is already known
+(meaning we've caught up to previously discovered data). Pass --full-sweep to
+disable this and fetch all pages regardless.
 
 Usage:
     python "src/distributed scraper/central_node.py"
     python "src/distributed scraper/central_node.py" --format pauper
     python "src/distributed scraper/central_node.py" --card "Lightning Bolt"
-    python "src/distributed scraper/central_node.py" --format commander --early-stop
+    python "src/distributed scraper/central_node.py" --format commander --full-sweep
 
 Environment:
-    DATABASE_URL  PostgreSQL connection string (required)
+    SCRAPER_API_URL   Base URL of the scraper API (default: http://localhost:8000)
+    API_KEY           Shared API key for authentication (required)
 """
 
 import argparse
@@ -26,54 +29,43 @@ import requests
 
 from config import (
     API_SEARCH,
-    HEADERS,
+    HEADERS as MOXFIELD_HEADERS,
     LEGAL_FORMATS,
     RATE_LIMIT_SECONDS,
+    SCRAPER_API_KEY,
+    SCRAPER_API_URL,
     encode_colors,
 )
-from db import apply_schema, get_connection
+
+_API_HEADERS = {"X-Api-Key": SCRAPER_API_KEY}
 
 
 # ---------------------------------------------------------------------------
-# Database helpers
+# Scraper API helpers
 # ---------------------------------------------------------------------------
 
-def get_cards_for_mode(conn, card: str | None, fmt: str | None) -> list[str]:
-    with conn.cursor() as cur:
-        if card:
-            return [card]
-        if fmt:
-            cur.execute(
-                f"SELECT card_name FROM cards WHERE legal_{fmt} = 'legal' ORDER BY card_name"
-            )
-        else:
-            cur.execute("SELECT card_name FROM cards ORDER BY card_name")
-        return [row[0] for row in cur.fetchall()]
+def _api_get_cards(fmt: str | None) -> list[str]:
+    params = {"format": fmt} if fmt else {}
+    resp = requests.get(
+        f"{SCRAPER_API_URL}/cards",
+        headers=_API_HEADERS,
+        params=params,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
-def upsert_deck(conn, deck: dict) -> None:
-    """
-    Insert or update a deck row.  The status column is intentionally excluded
-    from ON CONFLICT updates so that a deck already claimed or done does not
-    get reset to 'discovered'.
-    """
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO decks (
-                public_id, name, format, author, color_mask,
-                created_at_utc, updated_at_utc, scraped_at, status
-            ) VALUES (
-                %(public_id)s, %(name)s, %(format)s, %(author)s, %(color_mask)s,
-                %(created_at_utc)s, %(updated_at_utc)s, %(scraped_at)s, 'discovered'
-            )
-            ON CONFLICT (public_id) DO UPDATE SET
-                name           = EXCLUDED.name,
-                format         = EXCLUDED.format,
-                author         = EXCLUDED.author,
-                color_mask     = EXCLUDED.color_mask,
-                updated_at_utc = EXCLUDED.updated_at_utc,
-                scraped_at     = EXCLUDED.scraped_at
-        """, deck)
+def _api_post_decks(decks: list[dict]) -> dict:
+    """POST a parsed page to the API. Returns {upserted, new, existing}."""
+    resp = requests.post(
+        f"{SCRAPER_API_URL}/decks",
+        headers=_API_HEADERS,
+        json=decks,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -84,14 +76,14 @@ def fetch_page(fmt: str | None, page: int, page_size: int, card_name: str | None
     params: dict = {
         "pageNumber":    page,
         "pageSize":      page_size,
-        "sortType":      "updated",
-        "sortDirection": "Descending",
+        "sortType":      "created",
+        "sortDirection": "descending",
     }
     if fmt:
         params["fmt"] = fmt
     if card_name:
         params["cardName"] = card_name
-    resp = requests.get(API_SEARCH, headers=HEADERS, params=params, timeout=15)
+    resp = requests.get(API_SEARCH, headers=MOXFIELD_HEADERS, params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
@@ -112,6 +104,7 @@ def parse_deck(raw: dict, fmt: str | None) -> dict:
 
 
 def moxfield_search_name(card_name: str) -> str:
+    """Strip the back-face name from double-faced cards for Moxfield search."""
     return card_name.split(" // ")[0] if " // " in card_name else card_name
 
 
@@ -120,15 +113,14 @@ def moxfield_search_name(card_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _sweep_one_card(
-    conn,
     card_name: str,
     fmt: str | None,
     page_size: int,
-    early_stop: bool,
+    full_sweep: bool,
 ) -> tuple[int, int]:
     """
     Paginate through Moxfield decks containing card_name.
-    Returns (new_decks_inserted, pages_fetched).
+    Returns (new_decks_discovered, pages_fetched).
     """
     search_name = moxfield_search_name(card_name)
     new_decks = 0
@@ -151,21 +143,22 @@ def _sweep_one_card(
         total_pages = data.get("totalPages", 1)
         print(f"    page {page}/{total_pages} ...", end=" ", flush=True)
 
-        page_new = 0
-        for raw in raw_decks:
-            deck = parse_deck(raw, fmt)
-            if not deck["public_id"]:
-                continue
-            upsert_deck(conn, deck)
-            page_new += 1
+        # Parse all decks once; filter entries with no public_id.
+        parsed_page = [d for raw in raw_decks if (d := parse_deck(raw, fmt))["public_id"]]
 
-        conn.commit()
-        print(f"{len(raw_decks)} decks upserted, {page_new} processed")
+        try:
+            result = _api_post_decks(parsed_page)
+        except requests.RequestException as exc:
+            print(f"\n    [warn] API error posting decks: {exc}, skipping page")
+            break
+
+        page_new = result["new"]
+        print(f"{len(raw_decks)} decks, {page_new} new")
         new_decks += page_new
 
         if page >= total_pages or len(raw_decks) < page_size:
             break
-        if early_stop and page_new == 0:
+        if not full_sweep and page_new < len(parsed_page):
             break
 
         page += 1
@@ -174,23 +167,23 @@ def _sweep_one_card(
     return new_decks, page
 
 
-def sweep(conn, card_names: list[str], fmt: str | None, page_size: int, early_stop: bool) -> None:
+def sweep(card_names: list[str], fmt: str | None, page_size: int, full_sweep: bool) -> None:
     n = len(card_names)
     fmt_label = fmt or "all formats"
-    print(f"Central node: sweeping {n} card(s) [{fmt_label}]  early_stop={'on' if early_stop else 'off'}")
+    print(f"Central node: sweeping {n} card(s) [{fmt_label}]  mode={'full' if full_sweep else 'incremental'}")
 
     total = 0
     w = len(str(n))
 
     for idx, card_name in enumerate(card_names, 1):
         print(f"\n  [{idx:>{w}}/{n}] {card_name}", flush=True)
-        new_decks, pages = _sweep_one_card(conn, card_name, fmt, page_size, early_stop)
+        new_decks, pages = _sweep_one_card(card_name, fmt, page_size, full_sweep)
         total += new_decks
         if new_decks:
             print(f"    -> +{new_decks} deck(s) across {pages} page(s)")
         time.sleep(RATE_LIMIT_SECONDS)
 
-    print(f"\nDone. {total} deck(s) upserted as 'discovered'.")
+    print(f"\nDone. {total} deck(s) discovered.")
 
 
 # ---------------------------------------------------------------------------
@@ -199,18 +192,18 @@ def sweep(conn, card_names: list[str], fmt: str | None, page_size: int, early_st
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Central node: discover Moxfield decks and store them in Postgres.",
+        description="Central node: discover Moxfield decks via the scraper API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes (mutually exclusive):
-  --card "Name"    Search decks containing a specific card.
+  --card "Name"    Search decks containing a specific card (skips API card lookup).
   --format <fmt>   Search decks for all cards legal in that format.
   (neither)        Search decks for every card in the cards table.
 
 Examples:
   python "src/distributed scraper/central_node.py" --format pauper
   python "src/distributed scraper/central_node.py" --card "Lightning Bolt"
-  python "src/distributed scraper/central_node.py" --format commander --early-stop
+  python "src/distributed scraper/central_node.py" --format commander --full-sweep
 """,
     )
 
@@ -220,24 +213,41 @@ Examples:
 
     parser.add_argument("--page-size",  dest="page_size",  type=int, default=100,
                         choices=[10, 25, 50, 64, 100])
-    parser.add_argument("--early-stop", dest="early_stop", action="store_true",
-                        help="Stop paginating a card once a full page is all already-seen decks")
+    parser.add_argument("--full-sweep", dest="full_sweep", action="store_true",
+                        help="Fetch all pages for every card, ignoring already-discovered decks")
 
     args = parser.parse_args()
 
-    conn = get_connection()
-    apply_schema(conn)
-
-    card_names = get_cards_for_mode(conn, args.card, args.format)
-    if not card_names:
-        print("No cards found in the database. Run seed_cards.py first.")
-        conn.close()
-        return
-
-    try:
-        sweep(conn, card_names, args.format, args.page_size, args.early_stop)
-    finally:
-        conn.close()
+    if args.card:
+        card_names = [args.card]
+        sweep(card_names, args.format, args.page_size, args.full_sweep)
+    elif args.format:
+        try:
+            card_names = _api_get_cards(args.format)
+        except requests.RequestException as exc:
+            print(f"ERROR: Could not reach API at {SCRAPER_API_URL}: {exc}")
+            return
+        if not card_names:
+            print("No cards found. Run seed_cards.py first, then restart the API.")
+            return
+        sweep(card_names, args.format, args.page_size, args.full_sweep)
+    else:
+        # No format specified: sweep every format independently so per-format
+        # Moxfield result pages aren't shared across formats (each gets its own
+        # 10,000-deck cap), and only cards legal in each format are searched.
+        for fmt in LEGAL_FORMATS:
+            print(f"\n{'='*60}")
+            print(f"Format: {fmt}")
+            print(f"{'='*60}")
+            try:
+                card_names = _api_get_cards(fmt)
+            except requests.RequestException as exc:
+                print(f"ERROR: Could not reach API at {SCRAPER_API_URL}: {exc}")
+                return
+            if not card_names:
+                print(f"No cards found for {fmt}, skipping.")
+                continue
+            sweep(card_names, fmt, args.page_size, args.full_sweep)
 
 
 if __name__ == "__main__":

@@ -108,14 +108,10 @@ class ScryfallClient:
 
         url = self._bulk_download_url(bulk_type)
         print(f"Downloading {bulk_type} from {url} ...")
-        resp = self._session.get(url, stream=True, timeout=300)
+        resp = self._session.get(url, timeout=300)
         resp.raise_for_status()
 
-        chunks = []
-        for chunk in resp.iter_content(chunk_size=1 << 20):  # 1 MB chunks
-            chunks.append(chunk)
-
-        raw = b"".join(chunks)
+        raw = resp.content
         cards = json.loads(raw)
 
         if cache_path:

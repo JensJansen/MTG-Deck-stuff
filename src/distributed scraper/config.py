@@ -2,6 +2,8 @@
 Shared constants for the distributed scraper.
 """
 
+import os
+
 API_SEARCH = "https://api2.moxfield.com/v2/decks/search"
 API_DECK   = "https://api2.moxfield.com/v2/decks/all/{public_id}"
 
@@ -28,6 +30,11 @@ BOARDS = [
     "commanders", "companions", "signatureSpells",
     "mainboard", "sideboard", "maybeboard", "attractions", "stickers",
 ]
+
+
+# Scraper API — nodes reach the API server via these; set in each node's environment.
+SCRAPER_API_URL = os.environ.get("SCRAPER_API_URL", "http://localhost:8000")
+SCRAPER_API_KEY = os.environ.get("API_KEY", "")
 
 
 def encode_colors(colors) -> int:

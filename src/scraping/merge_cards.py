@@ -8,7 +8,7 @@ DATA SOURCES
               exposes are populated. This is the operational database; the
               deck_cards table has a hard FK on cards.id.
 
-- cards.db  : Built by the Scryfall bulk importer (cards_db.py). Contains rich
+- cards.db  : Built by the Scryfall bulk importer (scryfall_bulk_cards_importer.py). Contains rich
               card metadata for every MTG card. Read-only throughout this script.
               After a successful run, cards.db is no longer needed for runtime
               queries — decks.db becomes the single source of truth.
@@ -51,14 +51,7 @@ import argparse
 import sqlite3
 from pathlib import Path
 
-# Mirrors the list in cards_db.py — all formats Scryfall tracks legality for.
-LEGAL_FORMATS = [
-    "standard", "future", "historic", "timeless", "gladiator",
-    "pioneer", "explorer", "modern", "legacy", "pauper", "vintage",
-    "penny", "commander", "oathbreaker", "standardbrawl", "brawl",
-    "alchemy", "paupercommander", "duel", "oldschool", "premodern",
-    "predh", "historicbrawl",
-]
+from constants import LEGAL_FORMATS
 
 DECKS_DB = Path(__file__).parents[1] / "data" / "decks.db"
 CARDS_DB = Path(__file__).parents[1] / "data" / "cards.db"
@@ -202,7 +195,7 @@ def backfill(
     Fill NULL columns on existing decks.db cards from Scryfall data.
     Returns (matched, backfilled, unmatched).
     """
-    rows = decks_conn.execute("SELECT id, card_name FROM cards").fetchall()
+    rows = decks_conn.execute("SELECT card_name FROM cards").fetchall()
 
     update_sql = _build_update_sql(available_cols)
 
@@ -211,7 +204,7 @@ def backfill(
     unmatched  = 0
 
     updates: list[tuple] = []
-    for _, card_name in rows:
+    for (card_name,) in rows:
         scryfall = scryfall_by_name.get(card_name.lower())
         if scryfall is None:
             unmatched += 1
@@ -294,7 +287,7 @@ def insert_new(
 def run(decks_db: Path, cards_db: Path, dry_run: bool, verbose: bool = False) -> None:
     if not cards_db.exists():
         print(f"ERROR: cards.db not found at {cards_db}")
-        print("Run src/scraping/cards_db.py first to build the Scryfall card catalogue.")
+        print("Run src/scraping/scryfall_bulk_cards_importer.py first to build the Scryfall card catalogue.")
         return
 
     print(f"Decks DB : {decks_db}")

@@ -138,3 +138,20 @@ CREATE TABLE IF NOT EXISTS deck_cards (
 
 CREATE INDEX IF NOT EXISTS idx_deck_cards_card_id ON deck_cards (card_id);
 CREATE INDEX IF NOT EXISTS idx_deck_cards_deck_id ON deck_cards (deck_id);
+
+
+-- ---------------------------------------------------------------------------
+-- collision_log
+-- Written by the API when a scraper node submits cards for a deck that is
+-- already marked 'done'. Query this table to monitor processing overlap.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS collision_log (
+    id          BIGSERIAL    PRIMARY KEY,
+    deck_id     TEXT         NOT NULL REFERENCES decks (public_id),
+    worker_id   TEXT         NOT NULL,
+    detected_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    detail      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_collision_log_deck_id     ON collision_log (deck_id);
+CREATE INDEX IF NOT EXISTS idx_collision_log_detected_at ON collision_log (detected_at);
