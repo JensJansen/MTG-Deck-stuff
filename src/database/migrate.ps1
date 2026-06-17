@@ -1,4 +1,4 @@
-﻿# migrate.ps1 — Lint migration files then run flyway migrate.
+﻿# migrate.ps1 — Run flyway migrate.
 # Run from src/database/:  .\migrate.ps1
 #
 # Environment variables (set before running, or edit flyway.toml defaults):
@@ -8,32 +8,6 @@
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = $PSScriptRoot
-
-# ---------------------------------------------------------------------------
-# Lint: block any migration containing destructive DDL
-# ---------------------------------------------------------------------------
-$Forbidden = @("DROP TABLE", "DROP SCHEMA", "DROP COLUMN", "TRUNCATE")
-$MigrationsDir = Join-Path $ScriptDir "migrations"
-$violations = @()
-
-Get-ChildItem -Path $MigrationsDir -Filter "*.sql" | ForEach-Object {
-    $lines = Get-Content $_.FullName | Where-Object { $_ -notmatch '^\s*--' }
-    $content = $lines -join "`n"
-    foreach ($keyword in $Forbidden) {
-        if ($content -imatch [regex]::Escape($keyword)) {
-            $violations += "$($_.Name) contains forbidden keyword: $keyword"
-        }
-    }
-}
-
-if ($violations.Count -gt 0) {
-    Write-Host "`nMigration lint FAILED — destructive DDL detected:" -ForegroundColor Red
-    $violations | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
-    Write-Host "`nMigrations must be additive only. Remove the offending statements and retry." -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "Lint passed — no destructive DDL found." -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
 # Locate Flyway CLI

@@ -36,7 +36,6 @@ CREATE TABLE IF NOT EXISTS cards (
 
     -- Format legalities: 'legal' | 'not_legal' | 'banned' | 'restricted' | NULL
     legal_standard        TEXT,
-    legal_future          TEXT,
     legal_historic        TEXT,
     legal_timeless        TEXT,
     legal_gladiator       TEXT,
@@ -68,7 +67,6 @@ CREATE INDEX IF NOT EXISTS idx_cards_ci_mask     ON cards (ci_mask);
 CREATE INDEX IF NOT EXISTS idx_cards_layout      ON cards (layout);
 
 CREATE INDEX IF NOT EXISTS idx_cards_legal_standard        ON cards (legal_standard);
-CREATE INDEX IF NOT EXISTS idx_cards_legal_future          ON cards (legal_future);
 CREATE INDEX IF NOT EXISTS idx_cards_legal_historic        ON cards (legal_historic);
 CREATE INDEX IF NOT EXISTS idx_cards_legal_timeless        ON cards (legal_timeless);
 CREATE INDEX IF NOT EXISTS idx_cards_legal_gladiator       ON cards (legal_gladiator);
