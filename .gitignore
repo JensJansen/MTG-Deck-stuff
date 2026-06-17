@@ -7,3 +7,7 @@ src/distributed scraper/.env
 
 # Generated / scraped data — rebuild locally
 src/viz/public/data/*.json
+
+# Flyway — CLI binary and config (config contains DB credentials)
+src/database/flyway-cli/
+src/database/flyway.toml

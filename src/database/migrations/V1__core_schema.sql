@@ -1,13 +1,14 @@
--- Distributed scraper PostgreSQL schema.
--- Mirrors the local SQLite schema (decks.db + cards.db merged) with:
---   - BIGSERIAL primary key on cards instead of SQLite rowid
---   - status / claimed_at / claimed_by columns on decks for distributed coordination
+-- V1: Core schema — cards, decks, deck_cards, collision_log
 --
--- Safe to run multiple times (all statements use IF NOT EXISTS / DO NOTHING).
+-- This migration is the baseline for existing databases.
+-- All statements use IF NOT EXISTS so the migration is safe to inspect
+-- even though Flyway will not execute it against a database that has been
+-- baselined (see flyway.toml: baselineOnMigrate = true).
 
 -- ---------------------------------------------------------------------------
 -- cards
--- Seeded once by seed_cards.py; never written by scraper nodes.
+-- Seeded once by seed_cards.py from a Scryfall bulk data export.
+-- Never written to by scraper nodes.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS cards (
     id               BIGSERIAL    PRIMARY KEY,
@@ -66,7 +67,6 @@ CREATE INDEX IF NOT EXISTS idx_cards_rarity      ON cards (rarity);
 CREATE INDEX IF NOT EXISTS idx_cards_ci_mask     ON cards (ci_mask);
 CREATE INDEX IF NOT EXISTS idx_cards_layout      ON cards (layout);
 
--- Per-format legality indexes (used by central_node card queries)
 CREATE INDEX IF NOT EXISTS idx_cards_legal_standard        ON cards (legal_standard);
 CREATE INDEX IF NOT EXISTS idx_cards_legal_future          ON cards (legal_future);
 CREATE INDEX IF NOT EXISTS idx_cards_legal_historic        ON cards (legal_historic);
@@ -107,7 +107,6 @@ CREATE TABLE IF NOT EXISTS decks (
     scraped_at       TEXT,
     cards_fetched_at TEXT,
 
-    -- Distributed coordination
     -- 'discovered' → ready for a scraper node to claim
     -- 'claimed'    → a scraper node is currently processing it
     -- 'done'       → cards have been fetched and stored
@@ -118,9 +117,8 @@ CREATE TABLE IF NOT EXISTS decks (
     claimed_by       TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_decks_status  ON decks (status);
-CREATE INDEX IF NOT EXISTS idx_decks_format  ON decks (format);
--- Index used by scraper_node batch claim to pick oldest-discovered decks first
+CREATE INDEX IF NOT EXISTS idx_decks_status        ON decks (status);
+CREATE INDEX IF NOT EXISTS idx_decks_format        ON decks (format);
 CREATE INDEX IF NOT EXISTS idx_decks_status_scraped ON decks (status, scraped_at);
 
 
@@ -143,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_deck_cards_deck_id ON deck_cards (deck_id);
 -- ---------------------------------------------------------------------------
 -- collision_log
 -- Written by the API when a scraper node submits cards for a deck that is
--- already marked 'done'. Query this table to monitor processing overlap.
+-- already marked 'done'. Monitors processing overlap in the distributed system.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS collision_log (
     id          BIGSERIAL    PRIMARY KEY,

@@ -57,45 +57,6 @@ def _load_env() -> None:
 
 
 # ---------------------------------------------------------------------------
-# DB setup
-# ---------------------------------------------------------------------------
-
-def init_stats_tables(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS card_stats (
-                card_name      TEXT    NOT NULL,
-                format         TEXT    NOT NULL,
-                deck_count     INTEGER NOT NULL,
-                total_decks    INTEGER NOT NULL,
-                inclusion_rate REAL    NOT NULL,
-                avg_quantity   REAL    NOT NULL,
-                PRIMARY KEY (card_name, format)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS card_pair_stats (
-                card_a             TEXT    NOT NULL,
-                card_b             TEXT    NOT NULL,
-                format             TEXT    NOT NULL,
-                cooccurrence_count INTEGER NOT NULL,
-                lift               REAL    NOT NULL,
-                pmi                REAL    NOT NULL,
-                jaccard            REAL    NOT NULL,
-                confidence_a_to_b  REAL    NOT NULL,
-                confidence_b_to_a  REAL    NOT NULL,
-                PRIMARY KEY (card_a, card_b, format)
-            )
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pair_card_a  ON card_pair_stats (card_a, format)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pair_card_b  ON card_pair_stats (card_b, format)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pair_lift     ON card_pair_stats (lift    DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pair_jaccard  ON card_pair_stats (jaccard DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pair_pmi      ON card_pair_stats (pmi     DESC)")
-    conn.commit()
-
-
-# ---------------------------------------------------------------------------
 # Stat computation — pushed to Postgres
 # ---------------------------------------------------------------------------
 
@@ -260,8 +221,6 @@ def _print_sample(pair_rows: list[tuple]) -> None:
 
 
 def run(conn, formats: list[str], boards: frozenset[str], min_cooccur: int) -> None:
-    init_stats_tables(conn)
-
     for fmt in formats:
         print(f"\n[{fmt}]")
 

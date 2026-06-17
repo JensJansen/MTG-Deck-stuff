@@ -63,25 +63,6 @@ def _load_env() -> None:
             os.environ[key] = value
 
 
-# ---------------------------------------------------------------------------
-# DB
-# ---------------------------------------------------------------------------
-
-def init_layout_table(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS card_layout (
-                card_name      TEXT NOT NULL,
-                format         TEXT NOT NULL,
-                x              REAL NOT NULL,
-                y              REAL NOT NULL,
-                color_identity TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (card_name, format)
-            )
-        """)
-    conn.commit()
-
-
 def get_formats(conn, fmt_filter: str | None) -> list[str]:
     if fmt_filter:
         return [fmt_filter]
@@ -182,8 +163,6 @@ def compute_umap_layout(
 # ---------------------------------------------------------------------------
 
 def run(conn, formats: list[str], min_decks: int, min_cooccur: int) -> None:
-    init_layout_table(conn)
-
     for fmt in formats:
         print(f"\n[{fmt}]")
 
