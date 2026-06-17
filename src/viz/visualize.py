@@ -18,15 +18,23 @@ dist_int = round((1 - jaccard) * 100); divided by 100 in JS to get float distanc
 Usage:
     python src/viz/visualize.py --format pauper
     python src/viz/visualize.py
+
+Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
 
 import argparse
 import json
-import sqlite3
+import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 
-DB_PATH    = Path(__file__).parents[1] / "data" / "decks.db"
+sys.path.insert(0, str(Path(__file__).parents[1]))
+
+import psycopg2
+
+from constants.moxfield import COLOR_BITS
+
 OUTPUT_DIR = Path(__file__).parent / "public" / "data"
 
 EGO_TOP_N         = 50
@@ -34,13 +42,11 @@ EGO_MIN_COOCCUR   = 5
 GRAPH_MIN_COOCCUR = 20
 FOCUS_MIN_COOCCUR = 5
 
-_COLOR_BITS = {"W": 1, "U": 2, "B": 4, "R": 8, "G": 16}
-
 
 def color_mask_from_identity(color_identity: str) -> int:
     if not color_identity:
         return 0
-    return sum(_COLOR_BITS.get(c.strip(), 0) for c in color_identity.split(",") if c.strip())
+    return sum(COLOR_BITS.get(c.strip(), 0) for c in color_identity.split(",") if c.strip())
 
 
 def categorize_color(color_identity: str) -> str:
@@ -51,28 +57,60 @@ def categorize_color(color_identity: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# .env loader
+# ---------------------------------------------------------------------------
+
+_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
+
+_ENV_TEMPLATE = """\
+DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
+API_KEY=your-api-key
+SCRAPER_API_URL=http://127.0.0.1:8000
+"""
+
+
+def _load_env() -> None:
+    if not _ENV_FILE.exists():
+        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ENV_FILE.write_text(_ENV_TEMPLATE)
+        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
+        return
+    for line in _ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+# ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def get_formats(conn: sqlite3.Connection, fmt_filter: str | None) -> list[str]:
+def get_formats(conn, fmt_filter: str | None) -> list[str]:
     if fmt_filter:
         return [fmt_filter]
-    return [r[0] for r in conn.execute(
-        "SELECT DISTINCT format FROM card_layout ORDER BY format"
-    )]
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT format FROM card_layout ORDER BY format")
+        return [r[0] for r in cur.fetchall()]
 
 
-def load_nodes(conn: sqlite3.Connection, fmt: str) -> list[dict]:
-    rows = conn.execute("""
-        SELECT
-            cl.card_name, cl.x, cl.y, cl.color_identity,
-            cs.deck_count, cs.total_decks, cs.inclusion_rate, cs.avg_quantity,
-            c.image_uri
-        FROM card_layout cl
-        JOIN card_stats cs ON cl.card_name = cs.card_name AND cl.format = cs.format
-        LEFT JOIN cards c ON cl.card_name = c.card_name COLLATE NOCASE
-        WHERE cl.format = ?
-    """, (fmt,)).fetchall()
+def load_nodes(conn, fmt: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                cl.card_name, cl.x, cl.y, cl.color_identity,
+                cs.deck_count, cs.total_decks, cs.inclusion_rate, cs.avg_quantity,
+                c.image_uri
+            FROM card_layout cl
+            JOIN card_stats cs ON cl.card_name = cs.card_name AND cl.format = cs.format
+            LEFT JOIN cards c ON cl.card_name = c.card_name
+            WHERE cl.format = %s
+        """, (fmt,))
+        rows = cur.fetchall()
 
     return [
         {
@@ -91,17 +129,17 @@ def load_nodes(conn: sqlite3.Connection, fmt: str) -> list[dict]:
     ]
 
 
-def load_ego(
-    conn: sqlite3.Connection,
-    fmt: str,
-    card_names: set[str],
-) -> dict[str, list[dict]]:
-    rows = conn.execute("""
-        SELECT card_a, card_b, cooccurrence_count, lift, jaccard
-        FROM card_pair_stats
-        WHERE format = ? AND cooccurrence_count >= ?
-        ORDER BY cooccurrence_count DESC
-    """, (fmt, EGO_MIN_COOCCUR)).fetchall()
+def load_ego(conn, fmt: str, card_names: set[str]) -> dict[str, list[dict]]:
+    card_list = list(card_names)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT card_a, card_b, cooccurrence_count, lift, jaccard
+            FROM card_pair_stats
+            WHERE format = %s AND cooccurrence_count >= %s
+              AND card_a = ANY(%s) AND card_b = ANY(%s)
+            ORDER BY cooccurrence_count DESC
+        """, (fmt, EGO_MIN_COOCCUR, card_list, card_list))
+        rows = cur.fetchall()
 
     ego: dict[str, list] = defaultdict(list)
     for card_a, card_b, cooccur, lift, jaccard in rows:
@@ -113,16 +151,14 @@ def load_ego(
     return dict(ego)
 
 
-def load_edges(
-    conn: sqlite3.Connection,
-    fmt: str,
-    name_to_idx: dict[str, int],
-) -> list[list[int]]:
-    rows = conn.execute("""
-        SELECT card_a, card_b, jaccard
-        FROM card_pair_stats
-        WHERE format = ? AND cooccurrence_count >= ?
-    """, (fmt, GRAPH_MIN_COOCCUR)).fetchall()
+def load_edges(conn, fmt: str, name_to_idx: dict[str, int]) -> list[list[int]]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT card_a, card_b, jaccard
+            FROM card_pair_stats
+            WHERE format = %s AND cooccurrence_count >= %s
+        """, (fmt, GRAPH_MIN_COOCCUR))
+        rows = cur.fetchall()
 
     edges = []
     for card_a, card_b, jaccard in rows:
@@ -133,18 +169,18 @@ def load_edges(
     return edges
 
 
-def load_focus(
-    conn: sqlite3.Connection,
-    fmt: str,
-    card_names: set[str],
-) -> dict[str, list]:
+def load_focus(conn, fmt: str, card_names: set[str]) -> dict[str, list]:
     """All co-occurring pairs (>=FOCUS_MIN_COOCCUR) as compact [name, count, lift] tuples."""
-    rows = conn.execute("""
-        SELECT card_a, card_b, cooccurrence_count, lift
-        FROM card_pair_stats
-        WHERE format = ? AND cooccurrence_count >= ?
-        ORDER BY cooccurrence_count DESC
-    """, (fmt, FOCUS_MIN_COOCCUR)).fetchall()
+    card_list = list(card_names)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT card_a, card_b, cooccurrence_count, lift
+            FROM card_pair_stats
+            WHERE format = %s AND cooccurrence_count >= %s
+              AND card_a = ANY(%s) AND card_b = ANY(%s)
+            ORDER BY cooccurrence_count DESC
+        """, (fmt, FOCUS_MIN_COOCCUR, card_list, card_list))
+        rows = cur.fetchall()
 
     focus: dict[str, list] = defaultdict(list)
     for card_a, card_b, cooccur, lift in rows:
@@ -159,7 +195,7 @@ def load_focus(
 # Export
 # ---------------------------------------------------------------------------
 
-def export_format(conn: sqlite3.Connection, fmt: str, output_dir: Path) -> bool:
+def export_format(conn, fmt: str, output_dir: Path) -> bool:
     nodes = load_nodes(conn, fmt)
     if not nodes:
         print(f"  No layout data for '{fmt}' — run precompute_layout.py first.")
@@ -183,7 +219,7 @@ def export_format(conn: sqlite3.Connection, fmt: str, output_dir: Path) -> bool:
     size_kb = out_path.stat().st_size // 1024
     print(f"  {out_path.name}  ({len(nodes):,} cards, {len(edges):,} edges, {size_kb} KB)")
 
-    focus = load_focus(conn, fmt, card_names)
+    focus      = load_focus(conn, fmt, card_names)
     focus_path = output_dir / f"{fmt}.focus.json"
     focus_path.write_text(json.dumps(focus, separators=(",", ":")), encoding="utf-8")
     focus_kb = focus_path.stat().st_size // 1024
@@ -209,21 +245,27 @@ def main() -> None:
     )
     parser.add_argument("--format", "-f", dest="format", default=None,
                         help="Limit to one format (default: all with layout data)")
-    parser.add_argument("--db", dest="db_path", default=str(DB_PATH))
     args = parser.parse_args()
 
-    conn = sqlite3.connect(args.db_path)
-    formats = get_formats(conn, args.format)
-    if not formats:
-        print("No layout data found — run precompute_layout.py first.")
-        conn.close()
+    _load_env()
+
+    pg_url = os.environ.get("DATABASE_URL")
+    if not pg_url:
+        print("ERROR: DATABASE_URL not set. Fill in src/distributed scraper/.env and retry.")
         return
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Output: {OUTPUT_DIR}")
+    conn = psycopg2.connect(pg_url)
 
-    exported = []
     try:
+        formats = get_formats(conn, args.format)
+        if not formats:
+            print("No layout data found — run precompute_layout.py first.")
+            return
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Output: {OUTPUT_DIR}")
+
+        exported = []
         for fmt in formats:
             print(f"\n[{fmt}]")
             if export_format(conn, fmt, OUTPUT_DIR):
@@ -232,7 +274,6 @@ def main() -> None:
         conn.close()
 
     if exported:
-        # Read existing manifest formats so we don't clobber other formats
         manifest_path = OUTPUT_DIR / "manifest.json"
         existing: list[str] = []
         if manifest_path.exists():

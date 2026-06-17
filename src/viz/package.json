@@ -12,14 +12,12 @@
     "cytoscape": "^3.34.0",
     "cytoscape-fcose": "^2.2.0",
     "d3": "^7.9.0",
-    "plotly.js-dist-min": "^2.27.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@types/cytoscape": "^3.21.9",
     "@types/d3": "^7.4.3",
-    "@types/plotly.js": "^2.12.29",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.1",

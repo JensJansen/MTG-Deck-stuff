@@ -1,7 +1,7 @@
 """
 deck_scraper.py - Scrape Moxfield decks targeted by a local card list.
 
-Rather than broad page scraping, this script queries the local card database
+Rather than broad page scraping, this script queries the Postgres card database
 to decide which cards to search for, then hits Moxfield's per-card search
 endpoint for each one (up to the 100-page API limit). Decks already stored
 and unchanged are skipped.
@@ -21,161 +21,148 @@ Usage:
     python src/scraping/deck_scraper.py
     python src/scraping/deck_scraper.py --full-sweep
     python src/scraping/deck_scraper.py --format commander --skip-cards
+
+Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
 
 import argparse
-import sqlite3
+import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parents[1]))
+
+import psycopg2
+import psycopg2.extras
 import requests
 
-from constants import COLOR_BITS, LEGAL_FORMATS, encode_colors
+from constants.moxfield import (
+    API_DECK, API_SEARCH, BOARDS, HEADERS, LEGAL_FORMATS, RATE_LIMIT_SECONDS, encode_colors,
+)
+
 
 # ---------------------------------------------------------------------------
-# Config
+# .env loader
 # ---------------------------------------------------------------------------
 
-API_SEARCH = "https://api2.moxfield.com/v2/decks/search"
-API_DECK   = "https://api2.moxfield.com/v2/decks/all/{public_id}"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; deck-gen-scraper/1.0)",
-    "Accept": "application/json",
-}
-RATE_LIMIT_SECONDS = 1.0
+_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
 
-BOARDS = [
-    "commanders", "companions", "signatureSpells",
-    "mainboard", "sideboard", "maybeboard", "attractions", "stickers",
-]
+_ENV_TEMPLATE = """\
+DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
+API_KEY=your-api-key
+SCRAPER_API_URL=http://127.0.0.1:8000
+"""
 
-DB_PATH = Path(__file__).parents[1] / "data" / "decks.db"
+
+def _load_env() -> None:
+    if not _ENV_FILE.exists():
+        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ENV_FILE.write_text(_ENV_TEMPLATE)
+        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
+        return
+    for line in _ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS decks (
-            public_id        TEXT PRIMARY KEY,
-            name             TEXT,
-            format           TEXT,
-            author           TEXT,
-            color_mask       INTEGER NOT NULL DEFAULT 0,
-            created_at_utc   TEXT,
-            updated_at_utc   TEXT,
-            scraped_at       TEXT,
-            cards_fetched_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS deck_cards (
-            deck_id  TEXT    NOT NULL REFERENCES decks(public_id) ON DELETE CASCADE,
-            card_id  INTEGER NOT NULL REFERENCES cards(id),
-            board    TEXT    NOT NULL,
-            quantity INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (deck_id, card_id, board)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_deck_cards_card_id ON deck_cards(card_id);
-        CREATE INDEX IF NOT EXISTS idx_deck_cards_deck_id ON deck_cards(deck_id);
-        CREATE INDEX IF NOT EXISTS idx_decks_format       ON decks(format);
-    """)
-    conn.commit()
+def upsert_deck(conn, deck: dict) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO decks (
+                public_id, name, format, author, color_mask,
+                created_at_utc, updated_at_utc, scraped_at
+            ) VALUES (
+                %(public_id)s, %(name)s, %(format)s, %(author)s, %(color_mask)s,
+                %(created_at_utc)s, %(updated_at_utc)s, %(scraped_at)s
+            )
+            ON CONFLICT (public_id) DO UPDATE SET
+                name           = EXCLUDED.name,
+                format         = EXCLUDED.format,
+                author         = EXCLUDED.author,
+                color_mask     = EXCLUDED.color_mask,
+                updated_at_utc = EXCLUDED.updated_at_utc,
+                scraped_at     = EXCLUDED.scraped_at
+        """, deck)
 
 
-def upsert_deck(conn: sqlite3.Connection, deck: dict) -> None:
-    conn.execute("""
-        INSERT INTO decks (
-            public_id, name, format, author, color_mask,
-            created_at_utc, updated_at_utc, scraped_at
-        ) VALUES (
-            :public_id, :name, :format, :author, :color_mask,
-            :created_at_utc, :updated_at_utc, :scraped_at
-        )
-        ON CONFLICT(public_id) DO UPDATE SET
-            name           = excluded.name,
-            format         = excluded.format,
-            author         = excluded.author,
-            color_mask     = excluded.color_mask,
-            updated_at_utc = excluded.updated_at_utc,
-            scraped_at     = excluded.scraped_at
-    """, deck)
-
-
-def deck_needs_card_fetch(conn: sqlite3.Connection, public_id: str, updated_at_utc: str | None) -> bool:
+def deck_needs_card_fetch(conn, public_id: str, updated_at_utc: str | None) -> bool:
     """Return True if the deck's cards have never been fetched, or the deck was updated since."""
-    row = conn.execute(
-        "SELECT cards_fetched_at, updated_at_utc FROM decks WHERE public_id = ?",
-        (public_id,)
-    ).fetchone()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT cards_fetched_at, updated_at_utc FROM decks WHERE public_id = %s",
+            (public_id,)
+        )
+        row = cur.fetchone()
     if not row or row[0] is None:
         return True
     return updated_at_utc is not None and updated_at_utc > row[1]
 
 
-def replace_deck_cards(
-    conn: sqlite3.Connection,
-    deck_id: str,
-    deck_card_rows: list[dict],
-) -> None:
+def replace_deck_cards(conn, deck_id: str, deck_card_rows: list[dict]) -> None:
     if not deck_card_rows:
         return
 
     names = list({r["card_name"] for r in deck_card_rows})
-    placeholders = ",".join("?" * len(names))
-    name_to_id: dict[str, int] = {
-        row[0]: row[1]
-        for row in conn.execute(
-            f"SELECT card_name, id FROM cards WHERE card_name IN ({placeholders})",
-            names,
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT card_name, id FROM cards WHERE card_name = ANY(%s)",
+            (names,)
         )
-    }
+        name_to_id: dict[str, int] = {row[0]: row[1] for row in cur.fetchall()}
 
     for name in names:
         if name not in name_to_id:
             print(f"    [warn] card not in DB, skipping: {name!r}")
 
-    conn.execute("DELETE FROM deck_cards WHERE deck_id = ?", (deck_id,))
-    conn.executemany(
-        "INSERT INTO deck_cards (deck_id, card_id, board, quantity) VALUES (?, ?, ?, ?)",
-        [
-            (deck_id, name_to_id[r["card_name"]], r["board"], r["quantity"])
-            for r in deck_card_rows
-            if r["card_name"] in name_to_id
-        ],
-    )
-    conn.execute(
-        "UPDATE decks SET cards_fetched_at = ? WHERE public_id = ?",
-        (datetime.now(timezone.utc).isoformat(), deck_id),
-    )
+    rows = [
+        (deck_id, name_to_id[r["card_name"]], r["board"], r["quantity"])
+        for r in deck_card_rows
+        if r["card_name"] in name_to_id
+    ]
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM deck_cards WHERE deck_id = %s", (deck_id,))
+        if rows:
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO deck_cards (deck_id, card_id, board, quantity) VALUES %s",
+                rows,
+            )
+        cur.execute(
+            "UPDATE decks SET cards_fetched_at = %s, status = 'done' WHERE public_id = %s",
+            (datetime.now(timezone.utc).isoformat(), deck_id),
+        )
 
 
-def _decks_with_cards(conn: sqlite3.Connection, public_ids: list[str]) -> set[str]:
+def _decks_with_cards(conn, public_ids: list[str]) -> set[str]:
     """Return the subset of public_ids that already have card rows in deck_cards."""
     if not public_ids:
         return set()
-    placeholders = ",".join("?" * len(public_ids))
-    return {
-        row[0]
-        for row in conn.execute(
-            f"SELECT DISTINCT deck_id FROM deck_cards WHERE deck_id IN ({placeholders})",
-            public_ids,
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT deck_id FROM deck_cards WHERE deck_id = ANY(%s)",
+            (public_ids,)
         )
-    }
+        return {row[0] for row in cur.fetchall()}
 
 
 # ---------------------------------------------------------------------------
 # Card selection
 # ---------------------------------------------------------------------------
 
-def get_cards_for_mode(
-    conn: sqlite3.Connection,
-    card: str | None,
-    fmt: str | None,
-) -> list[str]:
+def get_cards_for_mode(conn, card: str | None, fmt: str | None) -> list[str]:
     """
     Return the ordered list of card names to drive deck searches.
       card set  → [card]
@@ -184,13 +171,14 @@ def get_cards_for_mode(
     """
     if card:
         return [card]
-    if fmt:
-        return [r[0] for r in conn.execute(
-            f"SELECT card_name FROM cards WHERE legal_{fmt} = 'legal' ORDER BY card_name"
-        )]
-    return [r[0] for r in conn.execute(
-        "SELECT card_name FROM cards ORDER BY card_name"
-    )]
+    with conn.cursor() as cur:
+        if fmt:
+            cur.execute(
+                f"SELECT card_name FROM cards WHERE legal_{fmt} = 'legal' ORDER BY card_name"
+            )
+        else:
+            cur.execute("SELECT card_name FROM cards ORDER BY card_name")
+        return [row[0] for row in cur.fetchall()]
 
 
 def moxfield_search_name(card_name: str) -> str:
@@ -202,12 +190,7 @@ def moxfield_search_name(card_name: str) -> str:
 # API
 # ---------------------------------------------------------------------------
 
-def fetch_page(
-    fmt: str | None,
-    page: int,
-    page_size: int,
-    card_name: str | None = None,
-) -> dict:
+def fetch_page(fmt: str | None, page: int, page_size: int, card_name: str | None = None) -> dict:
     params: dict = {
         "pageNumber":    page,
         "pageSize":      page_size,
@@ -247,7 +230,6 @@ def parse_deck(raw: dict, fmt: str | None) -> dict:
 def parse_deck_detail(detail: dict) -> list[dict]:
     """Returns deck_card_rows: [{card_name, board, quantity}]."""
     deck_card_rows: list[dict] = []
-
     for board_name in BOARDS:
         board_data = detail.get(board_name) or {}
         for entry in board_data.values():
@@ -259,7 +241,6 @@ def parse_deck_detail(detail: dict) -> list[dict]:
                 "board":     board_name,
                 "quantity":  entry.get("quantity", 1),
             })
-
     return deck_card_rows
 
 
@@ -267,10 +248,7 @@ def parse_deck_detail(detail: dict) -> list[dict]:
 # Core sweep logic
 # ---------------------------------------------------------------------------
 
-def _fetch_cards_for_page(
-    raw_decks: list[dict],
-    conn: sqlite3.Connection,
-) -> int:
+def _fetch_cards_for_page(raw_decks: list[dict], conn) -> int:
     """Fetch and store card details for new or updated decks. Returns deck-card rows written."""
     rows_written = 0
     for raw in raw_decks:
@@ -298,22 +276,14 @@ def _fetch_cards_for_page(
 
 
 def _sweep_one_card(
-    conn: sqlite3.Connection,
+    conn,
     card_name: str,
     fmt: str | None,
     page_size: int,
     fetch_cards: bool,
     full_sweep: bool,
 ) -> tuple[int, int]:
-    """
-    Paginate through all Moxfield decks containing card_name (filtered by fmt if given).
-    Returns (new_decks_saved, pages_fetched).
-    """
-    # Incremental mode requires card rows to detect already-scraped decks.
-    # If card fetching is disabled there is nothing to check against, so
-    # fall back to full-sweep behaviour automatically.
     effective_full_sweep = full_sweep or not fetch_cards
-
     search_name = moxfield_search_name(card_name)
     new_decks = 0
     page = 1
@@ -335,10 +305,8 @@ def _sweep_one_card(
         total_pages = data.get("totalPages", 1)
         print(f"    page {page}/{total_pages} ...", end=" ", flush=True)
 
-        # Parse all decks on this page once, filtering out entries with no ID.
         parsed_page = [d for raw in raw_decks if (d := parse_deck(raw, fmt))["public_id"]]
 
-        # One batch query to find which of these already have card rows.
         has_cards = (
             set() if effective_full_sweep
             else _decks_with_cards(conn, [d["public_id"] for d in parsed_page])
@@ -361,7 +329,6 @@ def _sweep_one_card(
 
         if page >= total_pages or len(raw_decks) < page_size:
             break
-
         if not effective_full_sweep and page_new < len(parsed_page):
             break
 
@@ -371,15 +338,7 @@ def _sweep_one_card(
     return new_decks, page
 
 
-def sweep(
-    conn: sqlite3.Connection,
-    db_path: Path,
-    card_names: list[str],
-    fmt: str | None,
-    page_size: int,
-    fetch_cards: bool,
-    full_sweep: bool,
-) -> None:
+def sweep(conn, card_names: list[str], fmt: str | None, page_size: int, fetch_cards: bool, full_sweep: bool) -> None:
     n = len(card_names)
     fmt_label = fmt or "all formats"
     mode = "full" if (full_sweep or not fetch_cards) else "incremental"
@@ -390,16 +349,13 @@ def sweep(
 
     for idx, card_name in enumerate(card_names, 1):
         print(f"\n  [{idx:>{w}}/{n}] {card_name}", flush=True)
-        new_decks, pages = _sweep_one_card(
-            conn, card_name, fmt, page_size, fetch_cards, full_sweep
-        )
+        new_decks, pages = _sweep_one_card(conn, card_name, fmt, page_size, fetch_cards, full_sweep)
         total_new_decks += new_decks
         if new_decks:
             print(f"    -> +{new_decks} new decks ({pages} page(s))")
-
         time.sleep(RATE_LIMIT_SECONDS)
 
-    print(f"\nDone. +{total_new_decks} new decks -> {db_path}")
+    print(f"\nDone. +{total_new_decks} new decks.")
 
 
 # ---------------------------------------------------------------------------
@@ -437,26 +393,26 @@ Examples:
                         help="Store deck metadata only; skip fetching card contents")
     parser.add_argument("--full-sweep", dest="full_sweep", action="store_true",
                         help="Fetch all pages for every card, ignoring already-scraped decks")
-    parser.add_argument("--db", dest="db_path", default=str(DB_PATH),
-                        help=f"SQLite database path (default: {DB_PATH})")
 
     args = parser.parse_args()
 
-    db_path = Path(args.db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON")
-    init_db(conn)
+    _load_env()
 
-    card_names = get_cards_for_mode(conn, args.card, args.format)
-    if not card_names:
-        print("No cards found matching the given criteria.")
-        conn.close()
+    pg_url = os.environ.get("DATABASE_URL")
+    if not pg_url:
+        print("ERROR: DATABASE_URL not set. Fill in src/distributed scraper/.env and retry.")
         return
 
+    conn = psycopg2.connect(pg_url)
+
     try:
+        card_names = get_cards_for_mode(conn, args.card, args.format)
+        if not card_names:
+            print("No cards found matching the given criteria.")
+            return
+
         sweep(
             conn=conn,
-            db_path=db_path,
             card_names=card_names,
             fmt=args.format,
             page_size=args.page_size,

@@ -3,207 +3,157 @@ group_query.py - Co-occurrence stats for a group of cards treated as a unit.
 
 Finds all decks (within a format) that contain every card in the group, then
 computes lift, PMI, Jaccard, and confidence for every other card that appears
-in those decks.
+in those decks. All metric computation runs in Postgres.
 
 Usage:
     python src/analysis/group_query.py --format pauper
-    python src/analysis/group_query.py --format commander --db path/to/decks.db
+    python src/analysis/group_query.py --format commander --sort jaccard --limit 20
+
+Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
 
 import argparse
-import math
-import sqlite3
+import os
 import sys
-from pathlib import Path
 
-from query import DB_PATH as DEFAULT_DB_PATH, resolve_card_name
+import psycopg2
 
-# Boards treated as part of the constructed deck
+from query import _load_env, resolve_card_name
+
 DEFAULT_BOARDS = frozenset({"mainboard", "commanders", "companions", "signatureSpells"})
-
-DISPLAY_LIMIT = 30
-CHUNK_SIZE    = 500
-
-
-def _get_card_ids(conn: sqlite3.Connection, card_names: list[str]) -> dict[str, int]:
-    """Return {card_name: id}, chunked to stay within SQLite's variable limit."""
-    result: dict[str, int] = {}
-    for i in range(0, len(card_names), CHUNK_SIZE):
-        chunk = card_names[i:i + CHUNK_SIZE]
-        phs = ",".join("?" * len(chunk))
-        rows = conn.execute(
-            f"SELECT card_name, id FROM cards WHERE card_name IN ({phs})",
-            chunk
-        ).fetchall()
-        for name, card_id in rows:
-            result[name] = card_id
-    return result
+SORT_CHOICES   = ["lift", "pmi", "jaccard", "confidence", "cooccurrence_count"]
+DEFAULT_LIMIT  = 30
 
 
 # ---------------------------------------------------------------------------
-# Data queries
+# Queries
 # ---------------------------------------------------------------------------
 
-def get_total_decks(conn: sqlite3.Connection, fmt: str) -> int:
-    return conn.execute(
-        "SELECT COUNT(*) FROM decks WHERE format = ?", (fmt,)
-    ).fetchone()[0]
+def _get_card_ids(conn, card_names: list[str]) -> dict[str, int]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT card_name, id FROM cards WHERE card_name = ANY(%s)", (card_names,))
+        return {r[0]: r[1] for r in cur.fetchall()}
 
 
-def find_group_deck_ids(
-    conn: sqlite3.Connection,
+def query_group_stats(
+    conn,
     fmt: str,
     group: set[str],
     boards: frozenset[str],
-) -> list[str]:
-    """Return deck IDs (in the given format) that contain every card in group."""
+    sort_by: str,
+    limit: int,
+) -> tuple[int, int, list[dict]]:
+    """
+    Returns (n_total, n_group, result_rows).
+
+    n_total  = processed decks in format (those with card data).
+    n_group  = decks containing every card in the group.
+    result_rows is empty when n_group = 0 or no cards co-occur above threshold.
+    """
     name_to_id = _get_card_ids(conn, list(group))
     if len(name_to_id) < len(group):
-        return []
-    card_ids = list(name_to_id.values())
+        missing = group - set(name_to_id)
+        print(f"  [warn] cards not found in DB: {sorted(missing)}")
+        return 0, 0, []
 
-    board_phs = ",".join("?" * len(boards))
-    id_phs    = ",".join("?" * len(card_ids))
+    group_ids   = list(name_to_id.values())
+    boards_list = list(boards)
 
-    rows = conn.execute(f"""
-        SELECT dc.deck_id
-        FROM deck_cards dc
-        JOIN decks d ON dc.deck_id = d.public_id
-        WHERE d.format = ?
-          AND dc.board IN ({board_phs})
-          AND dc.card_id IN ({id_phs})
-        GROUP BY dc.deck_id
-        HAVING COUNT(DISTINCT dc.card_id) = ?
-    """, [fmt, *boards, *card_ids, len(card_ids)]).fetchall()
+    # Round-trip 1: counts only (fast — no card joins needed)
+    with conn.cursor() as cur:
+        cur.execute("""
+            WITH
+            n_total AS (
+                SELECT COUNT(DISTINCT dc.deck_id) AS n
+                FROM deck_cards dc
+                JOIN decks d ON dc.deck_id = d.public_id
+                WHERE d.format = %s AND dc.board = ANY(%s)
+            ),
+            group_decks AS (
+                SELECT dc.deck_id
+                FROM deck_cards dc
+                JOIN decks d ON dc.deck_id = d.public_id
+                WHERE d.format = %s
+                  AND dc.board = ANY(%s)
+                  AND dc.card_id = ANY(%s)
+                GROUP BY dc.deck_id
+                HAVING COUNT(DISTINCT dc.card_id) = %s
+            )
+            SELECT nt.n, (SELECT COUNT(*) FROM group_decks)
+            FROM n_total nt
+        """, (fmt, boards_list, fmt, boards_list, group_ids, len(group_ids)))
+        n_total, n_group = cur.fetchone()
 
-    return [r[0] for r in rows]
+    if n_group == 0:
+        return n_total, 0, []
 
-
-def cooccurrence_counts(
-    conn: sqlite3.Connection,
-    group_deck_ids: list[str],
-    exclude: set[str],
-    boards: frozenset[str],
-) -> dict[str, int]:
-    """For each card (not in exclude) that appears in any group deck, return count of group decks it appears in."""
-    if not group_deck_ids:
-        return {}
-
-    excl_ids   = set(_get_card_ids(conn, list(exclude)).values())
-    board_phs  = ",".join("?" * len(boards))
-    excl_phs   = ",".join("?" * len(excl_ids)) if excl_ids else None
-
-    counts: dict[str, int] = {}
-
-    for i in range(0, len(group_deck_ids), CHUNK_SIZE):
-        chunk    = group_deck_ids[i:i + CHUNK_SIZE]
-        deck_phs = ",".join("?" * len(chunk))
-
-        params: list = [*chunk, *boards]
-        if excl_ids:
-            params.extend(sorted(excl_ids))
-
-        excl_clause = f"AND dc.card_id NOT IN ({excl_phs})" if excl_ids else ""
-
-        rows = conn.execute(f"""
-            SELECT c.card_name, COUNT(DISTINCT dc.deck_id) AS cooccur
-            FROM deck_cards dc
-            JOIN cards c ON dc.card_id = c.id
-            WHERE dc.deck_id IN ({deck_phs})
-              AND dc.board IN ({board_phs})
-              {excl_clause}
-            GROUP BY dc.card_id
-        """, params).fetchall()
-
-        for name, cnt in rows:
-            counts[name] = counts.get(name, 0) + cnt
-
-    return counts
-
-
-def per_card_deck_counts(
-    conn: sqlite3.Connection,
-    fmt: str,
-    card_names: list[str],
-    boards: frozenset[str],
-) -> dict[str, int]:
-    """Return total deck count per card across the whole format."""
-    if not card_names:
-        return {}
-
-    name_to_id = _get_card_ids(conn, card_names)
-    id_to_name = {v: k for k, v in name_to_id.items()}
-    card_ids   = list(name_to_id.values())
-
-    board_phs = ",".join("?" * len(boards))
-    counts: dict[str, int] = {}
-
-    for i in range(0, len(card_ids), CHUNK_SIZE):
-        chunk  = card_ids[i:i + CHUNK_SIZE]
-        id_phs = ",".join("?" * len(chunk))
-
-        rows = conn.execute(f"""
-            SELECT dc.card_id, COUNT(DISTINCT dc.deck_id) AS cnt
-            FROM deck_cards dc
-            JOIN decks d ON dc.deck_id = d.public_id
-            WHERE d.format = ?
-              AND dc.board IN ({board_phs})
-              AND dc.card_id IN ({id_phs})
-            GROUP BY dc.card_id
-        """, [fmt, *boards, *chunk]).fetchall()
-
-        for card_id, cnt in rows:
-            name = id_to_name.get(card_id)
-            if name:
-                counts[name] = cnt
-
-    return counts
-
-
-# ---------------------------------------------------------------------------
-# Metric computation
-# ---------------------------------------------------------------------------
-
-def compute_group_stats(
-    cooccur: dict[str, int],
-    card_totals: dict[str, int],
-    n_group_decks: int,
-    n_total_decks: int,
-) -> list[dict]:
-    p_group = n_group_decks / n_total_decks
-    rows = []
-
-    for card, cooccur_count in cooccur.items():
-        card_total = card_totals.get(card, 0)
-        if card_total == 0:
-            continue
-
-        p_card  = card_total  / n_total_decks
-        p_joint = cooccur_count / n_total_decks
-
-        lift       = p_joint / (p_group * p_card)
-        pmi        = math.log(p_joint / (p_group * p_card))
-        jaccard    = cooccur_count / (n_group_decks + card_total - cooccur_count)
-        confidence = cooccur_count / n_group_decks
-
-        rows.append({
-            "card_name":          card,
-            "cooccurrence_count": cooccur_count,
-            "lift":               lift,
-            "pmi":                pmi,
-            "jaccard":            jaccard,
-            "confidence":         confidence,
-        })
-
-    top_by_cooccur = sorted(rows, key=lambda r: r["cooccurrence_count"], reverse=True)[:DISPLAY_LIMIT]
-    return sorted(top_by_cooccur, key=lambda r: r["lift"], reverse=True)
+    # Round-trip 2: full co-occurrence stats computed in Postgres
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            WITH
+            n_total AS (
+                SELECT COUNT(DISTINCT dc.deck_id) AS n
+                FROM deck_cards dc
+                JOIN decks d ON dc.deck_id = d.public_id
+                WHERE d.format = %s AND dc.board = ANY(%s)
+            ),
+            group_decks AS (
+                SELECT dc.deck_id
+                FROM deck_cards dc
+                JOIN decks d ON dc.deck_id = d.public_id
+                WHERE d.format = %s
+                  AND dc.board = ANY(%s)
+                  AND dc.card_id = ANY(%s)
+                GROUP BY dc.deck_id
+                HAVING COUNT(DISTINCT dc.card_id) = %s
+            ),
+            n_group AS (SELECT COUNT(*) AS n FROM group_decks),
+            cooccur AS (
+                SELECT dc.card_id, COUNT(DISTINCT dc.deck_id) AS cooccurrence_count
+                FROM deck_cards dc
+                JOIN group_decks gd ON dc.deck_id = gd.deck_id
+                WHERE dc.board = ANY(%s)
+                  AND NOT (dc.card_id = ANY(%s))
+                GROUP BY dc.card_id
+            ),
+            card_totals AS (
+                SELECT dc.card_id, COUNT(DISTINCT dc.deck_id) AS total_count
+                FROM deck_cards dc
+                JOIN decks d   ON dc.deck_id  = d.public_id
+                JOIN cooccur co ON dc.card_id = co.card_id
+                WHERE d.format = %s AND dc.board = ANY(%s)
+                GROUP BY dc.card_id
+            )
+            SELECT
+                c.card_name,
+                co.cooccurrence_count,
+                (co.cooccurrence_count::float * nt.n) / (ng.n::float * ct.total_count)        AS lift,
+                LN((co.cooccurrence_count::float * nt.n) / (ng.n::float * ct.total_count))    AS pmi,
+                co.cooccurrence_count::float / (ng.n + ct.total_count - co.cooccurrence_count) AS jaccard,
+                co.cooccurrence_count::float / ng.n                                            AS confidence
+            FROM cooccur co
+            JOIN card_totals ct ON co.card_id = ct.card_id
+            JOIN cards c        ON co.card_id = c.id
+            CROSS JOIN n_total nt
+            CROSS JOIN n_group ng
+            ORDER BY {sort_by} DESC
+            LIMIT %s
+        """, (
+            fmt, boards_list,                              # n_total
+            fmt, boards_list, group_ids, len(group_ids),  # group_decks
+            boards_list, group_ids,                        # cooccur
+            fmt, boards_list,                              # card_totals
+            limit,
+        ))
+        cols = [d[0] for d in cur.description]
+        return n_total, n_group, [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
 # Interactive card input
 # ---------------------------------------------------------------------------
 
-def collect_group(conn: sqlite3.Connection, fmt: str) -> set[str]:
+def collect_group(conn, fmt: str) -> set[str]:
     """Interactively collect card names into a group. Returns the final set."""
     group: set[str] = set()
 
@@ -238,10 +188,18 @@ def collect_group(conn: sqlite3.Connection, fmt: str) -> set[str]:
 # Output
 # ---------------------------------------------------------------------------
 
-def print_results(rows: list[dict], group: set[str], fmt: str, n_group_decks: int, n_total: int) -> None:
+def print_results(
+    rows: list[dict],
+    group: set[str],
+    fmt: str,
+    n_group: int,
+    n_total: int,
+    sort_by: str,
+) -> None:
     group_label = " + ".join(sorted(group))
     print(f"\n=== Group: [{group_label}]  [{fmt}] ===")
-    print(f"    Decks containing full group: {n_group_decks} / {n_total}  ({n_group_decks/n_total:.1%})\n")
+    print(f"    Decks containing full group: {n_group} / {n_total}  ({n_group/n_total:.1%})")
+    print(f"    Sorted by: {sort_by}\n")
 
     if not rows:
         print("  No co-occurring cards found.")
@@ -263,38 +221,26 @@ def print_results(rows: list[dict], group: set[str], fmt: str, n_group_decks: in
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def run(fmt: str, boards: frozenset[str], db_path: Path) -> None:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-
-    n_total = get_total_decks(conn, fmt)
-    if n_total == 0:
-        print(f"No decks found for format '{fmt}'. Have you scraped data for this format?")
-        conn.close()
-        sys.exit(1)
+def run(conn, fmt: str, boards: frozenset[str], sort_by: str, limit: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM decks WHERE format = %s AND status = 'done'", (fmt,))
+        if cur.fetchone()[0] == 0:
+            print(f"No processed decks found for format '{fmt}'. Have you scraped data?")
+            sys.exit(1)
 
     group = collect_group(conn, fmt)
-
     if not group:
         print("No cards entered. Exiting.")
-        conn.close()
         sys.exit(0)
 
     print(f"\nSearching for decks containing all {len(group)} card(s)...")
-    group_deck_ids = find_group_deck_ids(conn, fmt, group, boards)
+    n_total, n_group, rows = query_group_stats(conn, fmt, group, boards, sort_by, limit)
 
-    if not group_deck_ids:
+    if n_group == 0:
         print(f"No decks in '{fmt}' contain all of: {sorted(group)}")
-        conn.close()
         sys.exit(0)
 
-    cooccur = cooccurrence_counts(conn, group_deck_ids, exclude=group, boards=boards)
-    card_totals = per_card_deck_counts(conn, fmt, list(cooccur.keys()), boards)
-
-    results = compute_group_stats(cooccur, card_totals, len(group_deck_ids), n_total)
-
-    print_results(results, group, fmt, len(group_deck_ids), n_total)
-    conn.close()
+    print_results(rows, group, fmt, n_group, n_total, sort_by)
 
 
 # ---------------------------------------------------------------------------
@@ -307,13 +253,28 @@ def main() -> None:
     )
     parser.add_argument("--format", "-f", dest="format", required=True,
                         help="Format to query (required)")
+    parser.add_argument("--sort", "-s", dest="sort", default="lift",
+                        choices=SORT_CHOICES,
+                        help="Metric to sort results by (default: lift)")
+    parser.add_argument("--limit", "-n", dest="limit", type=int, default=DEFAULT_LIMIT,
+                        help=f"Number of results to show (default: {DEFAULT_LIMIT})")
     parser.add_argument("--include-sideboard", dest="include_sideboard", action="store_true",
                         help="Also count sideboard cards")
-    parser.add_argument("--db", dest="db_path", default=str(DEFAULT_DB_PATH))
     args = parser.parse_args()
 
+    _load_env()
+
+    pg_url = os.environ.get("DATABASE_URL")
+    if not pg_url:
+        print("ERROR: DATABASE_URL not set. Fill in src/distributed scraper/.env and retry.")
+        sys.exit(1)
+
     boards = DEFAULT_BOARDS | ({"sideboard"} if args.include_sideboard else set())
-    run(args.format, boards, Path(args.db_path))
+    conn   = psycopg2.connect(pg_url)
+    try:
+        run(conn, args.format, boards, args.sort, args.limit)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

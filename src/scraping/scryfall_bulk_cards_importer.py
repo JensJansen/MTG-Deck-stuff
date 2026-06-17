@@ -1,117 +1,94 @@
 """
-Download all MTG cards from Scryfall's bulk-data endpoint and store them
-in a local SQLite database (cards.db).  Completely separate from decks.db.
+Download all MTG cards from Scryfall's bulk-data endpoint and upsert them
+directly into the Postgres cards table.
 
 Usage:
     python src/scraping/scryfall_bulk_cards_importer.py                        # oracle_cards (~27k unique cards)
     python src/scraping/scryfall_bulk_cards_importer.py --bulk all_cards       # every printing (~110k+)
     python src/scraping/scryfall_bulk_cards_importer.py --cache                # save raw JSON to disk; reuse on next run
-    python src/scraping/scryfall_bulk_cards_importer.py --db path/to/custom.db
     python src/scraping/scryfall_bulk_cards_importer.py --info                 # show DB stats only, no download
+
+Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
 
 import argparse
 import json
-import sqlite3
+import os
+import sys
 import time
 from pathlib import Path
 
-from constants import COLOR_BITS, LEGAL_FORMATS, encode_colors
+sys.path.insert(0, str(Path(__file__).parents[1]))
+
+import psycopg2
+import psycopg2.extras
+
+from constants.moxfield import LEGAL_FORMATS, encode_colors
 from scryfall import ScryfallClient
 
-DB_PATH   = Path(__file__).parents[1] / "data" / "cards.db"
-CACHE_DIR = Path(__file__).parents[1] / "data" / "cache"
-
+CACHE_DIR  = Path(__file__).parents[1] / "data" / "cache"
+BATCH_SIZE = 500
 
 # ---------------------------------------------------------------------------
-# Schema
+# .env loader
 # ---------------------------------------------------------------------------
 
-def _legality_columns_ddl() -> str:
-    return "\n".join(
-        f"    legal_{fmt:<20} TEXT,"
-        for fmt in LEGAL_FORMATS
-    )
+_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
 
-
-DDL = f"""
-CREATE TABLE IF NOT EXISTS cards (
-    -- Scryfall identity
-    scryfall_id      TEXT PRIMARY KEY,
-    oracle_id        TEXT NOT NULL,
-    name             TEXT NOT NULL,
-    lang             TEXT NOT NULL DEFAULT 'en',
-    layout           TEXT,
-
-    -- Gameplay (NULL on DFCs without top-level fields)
-    mana_cost        TEXT,
-    cmc              REAL NOT NULL DEFAULT 0,
-    type_line        TEXT,
-    oracle_text      TEXT,
-    flavor_text      TEXT,
-    power            TEXT,
-    toughness        TEXT,
-    loyalty          TEXT,
-    defense          TEXT,
-
-    -- Colors (bitmask: W=1 U=2 B=4 R=8 G=16)
-    color_mask       INTEGER NOT NULL DEFAULT 0,
-    ci_mask          INTEGER NOT NULL DEFAULT 0,
-
-    -- Print / edition info
-    released_at      TEXT,
-    rarity           TEXT,
-    artist           TEXT,
-    border_color     TEXT,
-    frame            TEXT,
-
-    -- Boolean flags (0/1)
-    reserved         INTEGER NOT NULL DEFAULT 0,
-    reprint          INTEGER NOT NULL DEFAULT 0,
-    digital          INTEGER NOT NULL DEFAULT 0,
-    foil             INTEGER NOT NULL DEFAULT 0,
-    nonfoil          INTEGER NOT NULL DEFAULT 0,
-    full_art         INTEGER NOT NULL DEFAULT 0,
-    textless         INTEGER NOT NULL DEFAULT 0,
-    oversized        INTEGER NOT NULL DEFAULT 0,
-    game_changer     INTEGER NOT NULL DEFAULT 0,
-    booster          INTEGER NOT NULL DEFAULT 0,
-    promo            INTEGER NOT NULL DEFAULT 0,
-
-    -- Rankings
-    edhrec_rank      INTEGER,
-
-    -- Single representative image URL (normal size; front face for DFCs)
-    image_uri        TEXT,
-
-    -- Keywords as a JSON array (e.g. ["Flying","Trample"])
-    keywords_json    TEXT,
-
-    -- Format legalities -- values: 'legal', 'not_legal', 'banned', 'restricted'
-{_legality_columns_ddl()}
-
-    -- Absorb trailing comma from legality columns
-    _reserved_col    INTEGER DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_cards_oracle_id   ON cards(oracle_id);
-CREATE INDEX IF NOT EXISTS idx_cards_name        ON cards(name);
-CREATE INDEX IF NOT EXISTS idx_cards_rarity      ON cards(rarity);
-CREATE INDEX IF NOT EXISTS idx_cards_ci_mask     ON cards(ci_mask);
-CREATE INDEX IF NOT EXISTS idx_cards_released_at ON cards(released_at);
-CREATE INDEX IF NOT EXISTS idx_cards_layout      ON cards(layout);
+_ENV_TEMPLATE = """\
+DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
+API_KEY=your-api-key
+SCRAPER_API_URL=http://127.0.0.1:8000
 """
 
-LEGALITY_INDEX_DDL = "\n".join(
-    f"CREATE INDEX IF NOT EXISTS idx_cards_legal_{fmt} ON cards(legal_{fmt});"
-    for fmt in LEGAL_FORMATS
-)
+
+def _load_env() -> None:
+    if not _ENV_FILE.exists():
+        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ENV_FILE.write_text(_ENV_TEMPLATE)
+        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
+        return
+    for line in _ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+# Columns written to Postgres in insertion order.
+# 'card_name' maps from Scryfall's 'name' field.
+COLUMNS = [
+    "card_name", "scryfall_id", "oracle_id", "layout",
+    "mana_cost", "cmc", "type_line", "oracle_text",
+    "power", "toughness", "loyalty", "defense",
+    "color_mask", "ci_mask", "rarity",
+    "reserved", "textless", "game_changer",
+    "edhrec_rank", "image_uri", "keywords_json",
+] + [f"legal_{fmt}" for fmt in LEGAL_FORMATS]
 
 
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(DDL)
-    conn.executescript(LEGALITY_INDEX_DDL)
-    conn.commit()
+# ---------------------------------------------------------------------------
+# SQL
+# ---------------------------------------------------------------------------
+
+def _build_upsert_sql() -> str:
+    col_list   = ", ".join(COLUMNS)
+    update_set = ",\n        ".join(
+        f"{c} = EXCLUDED.{c}"
+        for c in COLUMNS if c != "card_name"
+    )
+    return f"""
+        INSERT INTO cards ({col_list})
+        VALUES %s
+        ON CONFLICT (card_name) DO UPDATE SET
+        {update_set}
+    """
+
+
+UPSERT_SQL = _build_upsert_sql()
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +104,6 @@ def _bool(v) -> int:
 
 
 def _image_uri(raw: dict) -> str | None:
-    """Pick one representative image URL."""
     uris = raw.get("image_uris")
     if uris:
         return uris.get("normal") or uris.get("large") or next(iter(uris.values()), None)
@@ -138,100 +114,50 @@ def _image_uri(raw: dict) -> str | None:
     return None
 
 
-def parse_card(raw: dict) -> dict:
+def parse_card(raw: dict) -> tuple:
+    """Parse a raw Scryfall card dict into a tuple ordered by COLUMNS."""
     legalities = raw.get("legalities") or {}
-    row: dict = {
-        "scryfall_id":  raw.get("id"),
-        "oracle_id":    raw.get("oracle_id", ""),
-        "name":         raw.get("name", ""),
-        "lang":         raw.get("lang", "en"),
-        "layout":       raw.get("layout"),
-
-        "mana_cost":    raw.get("mana_cost"),
-        "cmc":          raw.get("cmc") or 0.0,
-        "type_line":    raw.get("type_line"),
-        "oracle_text":  raw.get("oracle_text"),
-        "flavor_text":  raw.get("flavor_text"),
-        "power":        raw.get("power"),
-        "toughness":    raw.get("toughness"),
-        "loyalty":      raw.get("loyalty"),
-        "defense":      raw.get("defense"),
-
-        "color_mask":   encode_colors(raw.get("colors", [])),
-        "ci_mask":      encode_colors(raw.get("color_identity", [])),
-
-        "released_at":  raw.get("released_at"),
-        "rarity":       raw.get("rarity"),
-        "artist":       raw.get("artist"),
-        "border_color": raw.get("border_color"),
-        "frame":        raw.get("frame"),
-
-        "reserved":     _bool(raw.get("reserved", False)),
-        "reprint":      _bool(raw.get("reprint", False)),
-        "digital":      _bool(raw.get("digital", False)),
-        "foil":         _bool(raw.get("foil", False)),
-        "nonfoil":      _bool(raw.get("nonfoil", False)),
-        "full_art":     _bool(raw.get("full_art", False)),
-        "textless":     _bool(raw.get("textless", False)),
-        "oversized":    _bool(raw.get("oversized", False)),
-        "game_changer": _bool(raw.get("game_changer", False)),
-        "booster":      _bool(raw.get("booster", False)),
-        "promo":        _bool(raw.get("promo", False)),
-
-        "edhrec_rank":  raw.get("edhrec_rank"),
-        "image_uri":    _image_uri(raw),
+    row = {
+        "card_name":     raw.get("name", ""),
+        "scryfall_id":   raw.get("id"),
+        "oracle_id":     raw.get("oracle_id", ""),
+        "layout":        raw.get("layout"),
+        "mana_cost":     raw.get("mana_cost"),
+        "cmc":           raw.get("cmc") or 0.0,
+        "type_line":     raw.get("type_line"),
+        "oracle_text":   raw.get("oracle_text"),
+        "power":         raw.get("power"),
+        "toughness":     raw.get("toughness"),
+        "loyalty":       raw.get("loyalty"),
+        "defense":       raw.get("defense"),
+        "color_mask":    encode_colors(raw.get("colors", [])),
+        "ci_mask":       encode_colors(raw.get("color_identity", [])),
+        "rarity":        raw.get("rarity"),
+        "reserved":      _bool(raw.get("reserved", False)),
+        "textless":      _bool(raw.get("textless", False)),
+        "game_changer":  _bool(raw.get("game_changer", False)),
+        "edhrec_rank":   raw.get("edhrec_rank"),
+        "image_uri":     _image_uri(raw),
         "keywords_json": json.dumps(raw.get("keywords") or [], ensure_ascii=False),
     }
     for fmt in LEGAL_FORMATS:
         row[f"legal_{fmt}"] = legalities.get(fmt)
-    return row
 
-
-def _build_upsert_sql() -> str:
-    legal_cols = [f"legal_{f}" for f in LEGAL_FORMATS]
-    all_cols = [
-        "scryfall_id", "oracle_id", "name", "lang", "layout",
-        "mana_cost", "cmc", "type_line", "oracle_text", "flavor_text",
-        "power", "toughness", "loyalty", "defense",
-        "color_mask", "ci_mask",
-        "released_at", "rarity", "artist", "border_color", "frame",
-        "reserved", "reprint", "digital", "foil", "nonfoil",
-        "full_art", "textless", "oversized", "game_changer", "booster", "promo",
-        "edhrec_rank", "image_uri", "keywords_json",
-    ] + legal_cols
-
-    cols_sql    = ", ".join(all_cols)
-    vals_sql    = ", ".join(f":{c}" for c in all_cols)
-    updates_sql = ",\n    ".join(
-        f"{c} = excluded.{c}"
-        for c in all_cols if c != "scryfall_id"
-    )
-    return f"""
-INSERT INTO cards ({cols_sql})
-VALUES ({vals_sql})
-ON CONFLICT(scryfall_id) DO UPDATE SET
-    {updates_sql}
-"""
-
-
-UPSERT_SQL = _build_upsert_sql()
+    return tuple(row[c] for c in COLUMNS)
 
 
 # ---------------------------------------------------------------------------
 # Import
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 500
-
-
-def import_cards(cards: list[dict], conn: sqlite3.Connection) -> tuple[int, int]:
-    ok = 0
+def import_cards(cards: list[dict], conn) -> tuple[int, int]:
+    total  = len(cards)
+    ok     = 0
     errors = 0
-    total = len(cards)
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = cards[batch_start : batch_start + BATCH_SIZE]
-        rows = []
+        rows  = []
         for raw in batch:
             try:
                 rows.append(parse_card(raw))
@@ -239,12 +165,13 @@ def import_cards(cards: list[dict], conn: sqlite3.Connection) -> tuple[int, int]
                 print(f"  [warn] parse error for {raw.get('name', '?')!r}: {exc}")
                 errors += 1
 
-        conn.executemany(UPSERT_SQL, rows)
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, UPSERT_SQL, rows)
         conn.commit()
         ok += len(rows)
 
         pct = min(batch_start + BATCH_SIZE, total) / total * 100
-        print(f"  {min(batch_start + BATCH_SIZE, total):>6}/{total}  ({pct:4.0f}%)", end="\r", flush=True)
+        print(f"  {min(ok, total):>6}/{total}  ({pct:4.0f}%)", end="\r", flush=True)
 
     print()
     return ok, errors
@@ -254,40 +181,36 @@ def import_cards(cards: list[dict], conn: sqlite3.Connection) -> tuple[int, int]
 # Info / stats
 # ---------------------------------------------------------------------------
 
-def print_db_stats(conn: sqlite3.Connection) -> None:
-    total = conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+def print_db_stats(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM cards")
+        total = cur.fetchone()[0]
+
     if total == 0:
-        print("Database is empty.")
+        print("cards table is empty.")
         return
 
     print(f"Total cards: {total:,}")
 
-    print("\nBy rarity:")
-    for row in conn.execute(
-        "SELECT rarity, COUNT(*) AS n FROM cards GROUP BY rarity ORDER BY n DESC"
-    ).fetchall():
-        print(f"  {row[0] or '(none)':<12} {row[1]:>7,}")
+    with conn.cursor() as cur:
+        cur.execute("SELECT rarity, COUNT(*) AS n FROM cards GROUP BY rarity ORDER BY n DESC")
+        print("\nBy rarity:")
+        for rarity, n in cur.fetchall():
+            print(f"  {rarity or '(none)':<12} {n:>7,}")
 
-    print("\nBy layout (top 10):")
-    for row in conn.execute(
-        "SELECT layout, COUNT(*) AS n FROM cards GROUP BY layout ORDER BY n DESC LIMIT 10"
-    ).fetchall():
-        print(f"  {row[0] or '(none)':<20} {row[1]:>7,}")
+        cur.execute(
+            "SELECT layout, COUNT(*) AS n FROM cards GROUP BY layout ORDER BY n DESC LIMIT 10"
+        )
+        print("\nBy layout (top 10):")
+        for layout, n in cur.fetchall():
+            print(f"  {layout or '(none)':<20} {n:>7,}")
 
-    print("\nLegality sample (pauper):")
-    for row in conn.execute(
-        "SELECT legal_pauper, COUNT(*) AS n FROM cards GROUP BY legal_pauper ORDER BY n DESC"
-    ).fetchall():
-        print(f"  {row[0] or '(null)':<15} {row[1]:>7,}")
-
-    print("\nExample query -- pauper-legal commons:")
-    rows = conn.execute(
-        "SELECT name, type_line FROM cards "
-        "WHERE legal_pauper = 'legal' AND rarity = 'common' "
-        "ORDER BY name LIMIT 8"
-    ).fetchall()
-    for r in rows:
-        print(f"  {r[0]:<30}  {r[1]}")
+        cur.execute(
+            "SELECT legal_pauper, COUNT(*) AS n FROM cards GROUP BY legal_pauper ORDER BY n DESC"
+        )
+        print("\nLegality sample (pauper):")
+        for status, n in cur.fetchall():
+            print(f"  {status or '(null)':<15} {n:>7,}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,14 +222,14 @@ BULK_TYPES = ["oracle_cards", "unique_artwork", "default_cards", "all_cards"]
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download all MTG cards from Scryfall and store in cards.db.",
+        description="Download MTG cards from Scryfall and upsert into Postgres.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python src/scraping/scryfall_bulk_cards_importer.py                         # oracle_cards (~27k unique cards)
-  python src/scraping/scryfall_bulk_cards_importer.py --bulk all_cards        # every printing (~110k+)
-  python src/scraping/scryfall_bulk_cards_importer.py --cache                 # cache JSON; reuse on subsequent runs
-  python src/scraping/scryfall_bulk_cards_importer.py --info                  # show DB stats without downloading
+  python src/scraping/scryfall_bulk_cards_importer.py
+  python src/scraping/scryfall_bulk_cards_importer.py --bulk all_cards
+  python src/scraping/scryfall_bulk_cards_importer.py --cache
+  python src/scraping/scryfall_bulk_cards_importer.py --info
 """,
     )
     parser.add_argument(
@@ -317,19 +240,19 @@ Examples:
         help="Save downloaded JSON to cache/ and reuse it on subsequent runs",
     )
     parser.add_argument(
-        "--db", dest="db_path", default=str(DB_PATH),
-    )
-    parser.add_argument(
         "--info", dest="info", action="store_true",
         help="Print database statistics and exit (no download)",
     )
     args = parser.parse_args()
 
-    db_path = Path(args.db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    init_db(conn)
+    _load_env()
+
+    pg_url = os.environ.get("DATABASE_URL")
+    if not pg_url:
+        print("ERROR: DATABASE_URL environment variable is not set.")
+        return
+
+    conn = psycopg2.connect(pg_url)
 
     if args.info:
         print_db_stats(conn)
@@ -349,12 +272,12 @@ Examples:
     t_download = time.perf_counter() - t0
     print(f"Downloaded {len(cards):,} cards in {t_download:.1f}s")
 
-    print(f"Importing into {db_path} ...")
+    print("Importing into Postgres ...")
     t1 = time.perf_counter()
     ok, errors = import_cards(cards, conn)
     t_import = time.perf_counter() - t1
+    print(f"Done: {ok:,} upserted, {errors} errors in {t_import:.1f}s")
 
-    print(f"Done: {ok:,} upserted, {errors} errors in {t_import:.1f}s  ->  {db_path}")
     print()
     print_db_stats(conn)
     conn.close()

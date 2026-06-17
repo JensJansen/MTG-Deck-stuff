@@ -6,39 +6,77 @@ Usage:
     python src/analysis/query.py "Lightning Bolt" --format pauper
     python src/analysis/query.py "Lightning Bolt" --sort jaccard --limit 20
     python src/analysis/query.py "Lightning Bolt" --format pauper --sort pmi
+
+Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
 
 import argparse
 import difflib
-import sqlite3
+import os
 import sys
 from pathlib import Path
 
-DB_PATH = Path(__file__).parents[1] / "data" / "decks.db"
+import psycopg2
 
 SORT_CHOICES = ["lift", "pmi", "jaccard", "confidence", "cooccurrence_count"]
 
+# ---------------------------------------------------------------------------
+# .env loader
+# ---------------------------------------------------------------------------
 
-def get_canonical_name(conn: sqlite3.Connection, card_name: str) -> str | None:
-    """Return the DB-canonical casing for card_name (case-insensitive lookup), or None."""
-    row = conn.execute(
-        "SELECT card_name FROM card_stats WHERE card_name = ? COLLATE NOCASE LIMIT 1",
-        (card_name,)
-    ).fetchone()
+_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
+
+_ENV_TEMPLATE = """\
+DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
+API_KEY=your-api-key
+SCRAPER_API_URL=http://127.0.0.1:8000
+"""
+
+
+def _load_env() -> None:
+    if not _ENV_FILE.exists():
+        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ENV_FILE.write_text(_ENV_TEMPLATE)
+        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
+        return
+    for line in _ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+# ---------------------------------------------------------------------------
+# Name resolution
+# ---------------------------------------------------------------------------
+
+def get_canonical_name(conn, card_name: str) -> str | None:
+    """Return the DB-canonical casing for card_name (case-insensitive), or None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT card_name FROM card_stats WHERE lower(card_name) = lower(%s) LIMIT 1",
+            (card_name,)
+        )
+        row = cur.fetchone()
     return row[0] if row else None
 
 
-def fuzzy_candidates(conn: sqlite3.Connection, card_name: str, n: int = 3) -> list[str]:
-    all_names = [r[0] for r in conn.execute("SELECT DISTINCT card_name FROM card_stats")]
+def fuzzy_candidates(conn, card_name: str, n: int = 3) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT card_name FROM card_stats")
+        all_names = [r[0] for r in cur.fetchall()]
     return difflib.get_close_matches(card_name, all_names, n=n, cutoff=0.6)
 
 
 def prompt_fuzzy_selection(candidates: list[str]) -> str | None:
-    """Present up to 3 candidates and return the chosen name, or None to abort."""
-    print(f"\nCard not found. Did you mean:")
+    print("\nCard not found. Did you mean:")
     for i, name in enumerate(candidates, 1):
         print(f"  [{i}] {name}")
-    print(f"  [0] Cancel")
+    print("  [0] Cancel")
 
     while True:
         try:
@@ -52,9 +90,9 @@ def prompt_fuzzy_selection(candidates: list[str]) -> str | None:
         print(f"  Please enter a number between 0 and {len(candidates)}.")
 
 
-def resolve_card_name(conn: sqlite3.Connection, card_name: str) -> str | None:
+def resolve_card_name(conn, card_name: str) -> str | None:
     """
-    Return the canonical card name to use. If the input matches (case-insensitively),
+    Return the canonical card name to use. If the input matches case-insensitively,
     return the DB-canonical casing. Otherwise offer fuzzy candidates and return the
     selection, or None if the user cancels / no candidates exist.
     """
@@ -68,60 +106,73 @@ def resolve_card_name(conn: sqlite3.Connection, card_name: str) -> str | None:
         print("Have you run compute_stats.py with enough data scraped?")
         return None
 
-    chosen = prompt_fuzzy_selection(candidates)
-    return chosen
+    return prompt_fuzzy_selection(candidates)
 
 
-def card_stats(conn: sqlite3.Connection, card_name: str, fmt: str | None) -> list[dict]:
-    query = """
-        SELECT format, deck_count, total_decks, inclusion_rate, avg_quantity
-        FROM card_stats
-        WHERE card_name = ? COLLATE NOCASE
-    """
-    params = [card_name]
+# ---------------------------------------------------------------------------
+# Queries
+# ---------------------------------------------------------------------------
+
+def card_stats(conn, card_name: str, fmt: str | None) -> list[dict]:
+    params: list = [card_name]
+    fmt_clause = ""
     if fmt:
-        query += " AND format = ?"
+        fmt_clause = "AND format = %s"
         params.append(fmt)
-    query += " ORDER BY inclusion_rate DESC"
-    rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT format, deck_count, total_decks, inclusion_rate, avg_quantity
+            FROM card_stats
+            WHERE card_name = %s
+            {fmt_clause}
+            ORDER BY inclusion_rate DESC
+        """, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def pair_stats(
-    conn: sqlite3.Connection,
+    conn,
     card_name: str,
     fmt: str | None,
     sort_by: str,
     limit: int,
 ) -> list[dict]:
-    sort_col = "confidence_a_to_b" if sort_by == "confidence" else sort_by
-    query = f"""
-        SELECT partner, format, cooccurrence_count, lift, pmi, jaccard, confidence
-        FROM (
+    sort_col = "confidence" if sort_by == "confidence" else sort_by
+    fmt_clause = "AND format = %s" if fmt else ""
+
+    # card_name repeated 4x: two CASE expressions + two WHERE conditions
+    params: list = [card_name, card_name, card_name, card_name]
+    if fmt:
+        params.append(fmt)
+    params.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
             SELECT
-                CASE WHEN card_a = :name COLLATE NOCASE THEN card_b ELSE card_a END AS partner,
+                CASE WHEN card_a = %s THEN card_b ELSE card_a END AS partner,
                 format,
                 cooccurrence_count,
                 lift,
                 pmi,
                 jaccard,
-                CASE WHEN card_a = :name COLLATE NOCASE
+                CASE WHEN card_a = %s
                      THEN confidence_a_to_b
                      ELSE confidence_b_to_a END AS confidence
             FROM card_pair_stats
-            WHERE (card_a = :name COLLATE NOCASE OR card_b = :name COLLATE NOCASE)
-            {"AND format = :fmt" if fmt else ""}
-            ORDER BY cooccurrence_count DESC
-            LIMIT :limit
-        )
-        ORDER BY {sort_col} DESC
-    """
-    params = {"name": card_name, "limit": limit}
-    if fmt:
-        params["fmt"] = fmt
-    rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+            WHERE (card_a = %s OR card_b = %s)
+            {fmt_clause}
+            ORDER BY {sort_col} DESC
+            LIMIT %s
+        """, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
 
 def print_card_stats(rows: list[dict], card_name: str) -> None:
     if not rows:
@@ -138,7 +189,7 @@ def print_card_stats(rows: list[dict], card_name: str) -> None:
 
 def print_pair_stats(rows: list[dict], card_name: str, sort_by: str) -> None:
     if not rows:
-        print(f"  No pairs found (threshold not met or stats not yet computed).")
+        print("  No pairs found (threshold not met or stats not yet computed).")
         return
     print(
         f"  {'Partner':<35} {'Fmt':<16} {'Cooccur':>7}"
@@ -152,19 +203,19 @@ def print_pair_stats(rows: list[dict], card_name: str, sort_by: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
 def lookup(
+    conn,
     card_name: str,
     fmt: str | None = None,
     sort_by: str = "lift",
     limit: int = 30,
-    db_path: Path = DB_PATH,
 ) -> None:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-
     resolved = resolve_card_name(conn, card_name)
     if resolved is None:
-        conn.close()
         sys.exit(1)
 
     if resolved != card_name:
@@ -180,8 +231,10 @@ def lookup(
     pstats = pair_stats(conn, resolved, fmt, sort_by, limit)
     print_pair_stats(pstats, resolved, sort_by)
 
-    conn.close()
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Look up co-occurrence stats for a card.")
@@ -193,16 +246,20 @@ def main() -> None:
                         help="Metric to sort co-occurring cards by (default: lift)")
     parser.add_argument("--limit", "-n", dest="limit", type=int, default=30,
                         help="Number of pairs to show (default: 30)")
-    parser.add_argument("--db", dest="db_path", default=str(DB_PATH))
     args = parser.parse_args()
 
-    lookup(
-        card_name=args.card,
-        fmt=args.format,
-        sort_by=args.sort,
-        limit=args.limit,
-        db_path=Path(args.db_path),
-    )
+    _load_env()
+
+    pg_url = os.environ.get("DATABASE_URL")
+    if not pg_url:
+        print("ERROR: DATABASE_URL not set. Fill in src/distributed scraper/.env and retry.")
+        sys.exit(1)
+
+    conn = psycopg2.connect(pg_url)
+    try:
+        lookup(conn, args.card, args.format, args.sort, args.limit)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

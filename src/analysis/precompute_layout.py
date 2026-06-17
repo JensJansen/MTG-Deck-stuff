@@ -8,16 +8,18 @@ Usage:
     python src/analysis/precompute_layout.py --format pauper
     python src/analysis/precompute_layout.py
     python src/analysis/precompute_layout.py --min-decks 10 --min-cooccur 10
+
+Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
 
 import argparse
-import sqlite3
+import os
 from pathlib import Path
 
+import psycopg2
+import psycopg2.extras
 import umap
 from scipy.sparse import csr_matrix
-
-DB_PATH = Path(__file__).parents[1] / "data" / "decks.db"
 
 _COLOR_BITS = {"W": 1, "U": 2, "B": 4, "R": 8, "G": 16}
 
@@ -32,86 +34,107 @@ def decode_colors(mask: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# .env loader
+# ---------------------------------------------------------------------------
+
+_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
+
+_ENV_TEMPLATE = """\
+DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
+API_KEY=your-api-key
+SCRAPER_API_URL=http://127.0.0.1:8000
+"""
+
+
+def _load_env() -> None:
+    if not _ENV_FILE.exists():
+        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ENV_FILE.write_text(_ENV_TEMPLATE)
+        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
+        return
+    for line in _ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+# ---------------------------------------------------------------------------
 # DB
 # ---------------------------------------------------------------------------
 
-def init_layout_table(conn: sqlite3.Connection) -> None:
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS card_layout (
-            card_name      TEXT NOT NULL,
-            format         TEXT NOT NULL,
-            x              REAL NOT NULL,
-            y              REAL NOT NULL,
-            color_identity TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (card_name, format)
-        );
-    """)
+def init_layout_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS card_layout (
+                card_name      TEXT NOT NULL,
+                format         TEXT NOT NULL,
+                x              REAL NOT NULL,
+                y              REAL NOT NULL,
+                color_identity TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (card_name, format)
+            )
+        """)
     conn.commit()
 
 
-def get_formats(conn: sqlite3.Connection, fmt_filter: str | None) -> list[str]:
+def get_formats(conn, fmt_filter: str | None) -> list[str]:
     if fmt_filter:
         return [fmt_filter]
-    return [r[0] for r in conn.execute(
-        "SELECT DISTINCT format FROM card_stats ORDER BY format"
-    )]
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT format FROM card_stats ORDER BY format")
+        return [r[0] for r in cur.fetchall()]
 
 
-def load_cards(conn: sqlite3.Connection, fmt: str, min_decks: int) -> dict[str, int]:
+def load_cards(conn, fmt: str, min_decks: int) -> dict[str, int]:
     """
-    Returns {card_name: deck_count} for cards that are both above the deck
-    threshold AND legal in the given format. Falls back to no legality filter
-    if the format has no corresponding legal_{fmt} column.
+    Returns {card_name: deck_count} for cards above the deck threshold
+    that are legal in the given format.
     """
-    legal_col = f"legal_{fmt}"
-    has_legal = legal_col in {r[1] for r in conn.execute("PRAGMA table_info(cards)")}
-
-    if has_legal:
-        rows = conn.execute(f"""
+    with conn.cursor() as cur:
+        cur.execute(f"""
             SELECT cs.card_name, cs.deck_count
             FROM card_stats cs
-            JOIN cards c ON cs.card_name = c.card_name COLLATE NOCASE
-            WHERE cs.format = ?
-              AND cs.deck_count >= ?
-              AND c.{legal_col} = 'legal'
-        """, (fmt, min_decks)).fetchall()
-    else:
-        rows = conn.execute("""
-            SELECT card_name, deck_count
-            FROM card_stats
-            WHERE format = ? AND deck_count >= ?
-        """, (fmt, min_decks)).fetchall()
-
-    return {r[0]: r[1] for r in rows}
+            JOIN cards c ON cs.card_name = c.card_name
+            WHERE cs.format = %s
+              AND cs.deck_count >= %s
+              AND c.legal_{fmt} = 'legal'
+        """, (fmt, min_decks))
+        return {r[0]: r[1] for r in cur.fetchall()}
 
 
 def load_pairs(
-    conn: sqlite3.Connection,
+    conn,
     fmt: str,
     card_set: set[str],
     min_cooccur: int,
 ) -> list[tuple[str, str, float]]:
     """Returns (card_a, card_b, jaccard) for pairs within card_set."""
-    rows = conn.execute("""
-        SELECT card_a, card_b, jaccard
-        FROM card_pair_stats
-        WHERE format = ? AND cooccurrence_count >= ?
-    """, (fmt, min_cooccur)).fetchall()
-    return [
-        (a, b, jac)
-        for a, b, jac in rows
-        if a in card_set and b in card_set
-    ]
+    card_list = list(card_set)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT card_a, card_b, jaccard
+            FROM card_pair_stats
+            WHERE format = %s
+              AND cooccurrence_count >= %s
+              AND card_a = ANY(%s)
+              AND card_b = ANY(%s)
+        """, (fmt, min_cooccur, card_list, card_list))
+        return cur.fetchall()
 
 
-def get_color_identities(conn: sqlite3.Connection, card_set: set[str]) -> dict[str, str]:
+def get_color_identities(conn, card_set: set[str]) -> dict[str, str]:
     """Return the decoded color identity string for each card."""
-    placeholders = ",".join("?" * len(card_set))
-    rows = conn.execute(
-        f"SELECT card_name, ci_mask FROM cards WHERE card_name IN ({placeholders})",
-        list(card_set),
-    ).fetchall()
-    return {r[0]: decode_colors(r[1] or 0) for r in rows}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT card_name, ci_mask FROM cards WHERE card_name = ANY(%s)",
+            (list(card_set),)
+        )
+        return {r[0]: decode_colors(r[1] or 0) for r in cur.fetchall()}
 
 
 # ---------------------------------------------------------------------------
@@ -158,12 +181,7 @@ def compute_umap_layout(
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def run(
-    conn: sqlite3.Connection,
-    formats: list[str],
-    min_decks: int,
-    min_cooccur: int,
-) -> None:
+def run(conn, formats: list[str], min_decks: int, min_cooccur: int) -> None:
     init_layout_table(conn)
 
     for fmt in formats:
@@ -173,10 +191,7 @@ def run(
         if not cards:
             print("  No cards meet the threshold — run compute_stats.py first.")
             continue
-        legal_col = f"legal_{fmt}"
-        has_legal = legal_col in {r[1] for r in conn.execute("PRAGMA table_info(cards)")}
-        legality_note = f", legal_{fmt} = 'legal'" if has_legal else " (no legality column, unfiltered)"
-        print(f"  {len(cards)} cards (deck_count >= {min_decks}{legality_note})")
+        print(f"  {len(cards)} cards (deck_count >= {min_decks}, legal_{fmt} = 'legal')")
 
         pairs = load_pairs(conn, fmt, set(cards), min_cooccur)
         print(f"  {len(pairs)} pairs (cooccurrence >= {min_cooccur})")
@@ -193,16 +208,17 @@ def run(
 
         color_ids = get_color_identities(conn, set(cards))
 
-        conn.execute("DELETE FROM card_layout WHERE format = ?", (fmt,))
-        conn.executemany(
-            "INSERT INTO card_layout (card_name, format, x, y, color_identity) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [
-                (card, fmt, pos[card][0], pos[card][1], color_ids.get(card, ""))
-                for card in card_list
-                if card in pos
-            ],
-        )
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM card_layout WHERE format = %s", (fmt,))
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO card_layout (card_name, format, x, y, color_identity) VALUES %s",
+                [
+                    (card, fmt, pos[card][0], pos[card][1], color_ids.get(card, ""))
+                    for card in card_list
+                    if card in pos
+                ],
+            )
         conn.commit()
         print(f"  Stored layout for {len(pos)} cards.")
 
@@ -223,20 +239,26 @@ def main() -> None:
     parser.add_argument("--min-cooccur", dest="min_cooccur", type=int,
                         default=DEFAULT_MIN_COOCCUR,
                         help=f"Minimum co-occurrence count for layout edges (default: {DEFAULT_MIN_COOCCUR})")
-    parser.add_argument("--db", dest="db_path", default=str(DB_PATH))
     args = parser.parse_args()
 
-    conn = sqlite3.connect(args.db_path)
-    formats = get_formats(conn, args.format)
-    if not formats:
-        print("No formats found — run compute_stats.py first.")
-        conn.close()
+    _load_env()
+
+    pg_url = os.environ.get("DATABASE_URL")
+    if not pg_url:
+        print("ERROR: DATABASE_URL not set. Fill in src/distributed scraper/.env and retry.")
         return
 
-    print(f"Formats: {', '.join(formats)}")
-    print(f"Min decks: {args.min_decks}  |  Min cooccur: {args.min_cooccur}")
+    conn = psycopg2.connect(pg_url)
 
     try:
+        formats = get_formats(conn, args.format)
+        if not formats:
+            print("No formats found — run compute_stats.py first.")
+            return
+
+        print(f"Formats: {', '.join(formats)}")
+        print(f"Min decks: {args.min_decks}  |  Min cooccur: {args.min_cooccur}")
+
         run(conn, formats, args.min_decks, args.min_cooccur)
     finally:
         conn.close()
