@@ -20,7 +20,7 @@ CLAIM_TIMEOUT_MINUTES = 30
 COLOR_BITS: dict[str, int] = {"W": 1, "U": 2, "B": 4, "R": 8, "G": 16}
 
 LEGAL_FORMATS: list[str] = [
-    "standard", "future", "historic", "timeless", "gladiator",
+    "standard", "historic", "timeless", "gladiator",
     "pioneer", "explorer", "modern", "legacy", "pauper", "vintage",
     "penny", "commander", "oathbreaker", "standardbrawl", "brawl",
     "alchemy", "paupercommander", "duel", "oldschool", "premodern",

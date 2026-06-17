@@ -21,7 +21,6 @@ Usage:
 """
 
 import os
-from contextlib import asynccontextmanager
 from typing import Annotated
 
 import psycopg2.extras
@@ -29,20 +28,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from config import CLAIM_TIMEOUT_MINUTES, LEGAL_FORMATS
-from db import apply_schema, get_connection
+from db import get_connection
 
 
-@asynccontextmanager
-async def _lifespan(app: FastAPI):
-    conn = get_connection()
-    try:
-        apply_schema(conn)
-    finally:
-        conn.close()
-    yield
-
-
-app = FastAPI(title="Deck Scraper API", version="1.0", lifespan=_lifespan)
+app = FastAPI(title="Deck Scraper API", version="1.0")
 
 _API_KEY = os.environ.get("API_KEY", "")
 if not _API_KEY:

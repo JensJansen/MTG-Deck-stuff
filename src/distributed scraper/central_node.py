@@ -15,6 +15,8 @@ Usage:
     python "src/distributed scraper/central_node.py" --format pauper
     python "src/distributed scraper/central_node.py" --card "Lightning Bolt"
     python "src/distributed scraper/central_node.py" --format commander --full-sweep
+    python "src/distributed scraper/central_node.py" --exclude-format pauper --exclude-format modern
+    python "src/distributed scraper/central_node.py" --exclude-format vintage --reversed
 
 Environment:
     SCRAPER_API_URL   Base URL of the scraper API (default: http://localhost:8000)
@@ -215,11 +217,18 @@ Examples:
                         choices=[10, 25, 50, 64, 100])
     parser.add_argument("--full-sweep", dest="full_sweep", action="store_true",
                         help="Fetch all pages for every card, ignoring already-discovered decks")
+    parser.add_argument("--exclude-format", "-x", dest="exclude_formats", action="append",
+                        default=[], choices=LEGAL_FORMATS, metavar="FORMAT",
+                        help="Exclude a format from the full sweep (repeatable). Ignored when --format is given.")
+    parser.add_argument("--reversed", dest="reversed", action="store_true",
+                        help="Process cards in reverse order within each format")
 
     args = parser.parse_args()
 
     if args.card:
         card_names = [args.card]
+        if args.reversed:
+            card_names = list(reversed(card_names))
         sweep(card_names, args.format, args.page_size, args.full_sweep)
     elif args.format:
         try:
@@ -230,12 +239,17 @@ Examples:
         if not card_names:
             print("No cards found. Run seed_cards.py first, then restart the API.")
             return
+        if args.reversed:
+            card_names = list(reversed(card_names))
         sweep(card_names, args.format, args.page_size, args.full_sweep)
     else:
         # No format specified: sweep every format independently so per-format
         # Moxfield result pages aren't shared across formats (each gets its own
         # 10,000-deck cap), and only cards legal in each format are searched.
-        for fmt in LEGAL_FORMATS:
+        formats = [f for f in LEGAL_FORMATS if f not in args.exclude_formats]
+        if args.exclude_formats:
+            print(f"Excluding formats: {', '.join(args.exclude_formats)}")
+        for fmt in formats:
             print(f"\n{'='*60}")
             print(f"Format: {fmt}")
             print(f"{'='*60}")
@@ -247,6 +261,8 @@ Examples:
             if not card_names:
                 print(f"No cards found for {fmt}, skipping.")
                 continue
+            if args.reversed:
+                card_names = list(reversed(card_names))
             sweep(card_names, fmt, args.page_size, args.full_sweep)
 
 
