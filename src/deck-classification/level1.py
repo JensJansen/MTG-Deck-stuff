@@ -28,7 +28,7 @@ from config import (
 )
 
 
-def reduce(embeddings: np.ndarray) -> np.ndarray:
+def _reduce(embeddings: np.ndarray) -> np.ndarray:
     """UMAP: (N, D) → (N, UMAP_N_COMPONENTS)."""
     print(f"  UMAP: {embeddings.shape} → ({len(embeddings)}, {UMAP_N_COMPONENTS})...")
     reducer = umap.UMAP(
@@ -43,7 +43,7 @@ def reduce(embeddings: np.ndarray) -> np.ndarray:
     return reducer.fit_transform(embeddings).astype(np.float32)
 
 
-def cluster(reduced: np.ndarray, n_decks: int) -> tuple[np.ndarray, np.ndarray]:
+def _cluster(reduced: np.ndarray, n_decks: int) -> tuple[np.ndarray, np.ndarray]:
     """
     HDBSCAN on UMAP-reduced embeddings.
 
@@ -86,8 +86,8 @@ def run(
         probs   : (N,) float32
     """
     print(f"\n── Level 1  [{fmt}]  {n_decks:,} decks ─────────────────────────────")
-    reduced        = reduce(embeddings)
-    labels, probs  = cluster(reduced, n_decks)
+    reduced        = _reduce(embeddings)
+    labels, probs  = _cluster(reduced, n_decks)
     return reduced, labels, probs
 
 

@@ -9,7 +9,6 @@ The full result of a pipeline run is passed as two structures:
 Existing rows for the same format and run_id are replaced so the pipeline
 can be re-run safely without accumulating stale data.
 """
-import json
 import sys
 from pathlib import Path
 
@@ -30,10 +29,10 @@ def clear_format(conn, fmt: str) -> None:
     """
     Remove all archetype records for a format before writing fresh ones.
     Cascades to deck_archetypes via the FK on archetype_id.
+    Does NOT commit — callers own the transaction.
     """
     with conn.cursor() as cur:
         cur.execute("DELETE FROM archetypes WHERE format = %s", (fmt,))
-    conn.commit()
     print(f"  Cleared existing archetypes for format={fmt!r}")
 
 
@@ -75,7 +74,7 @@ def write_archetypes(
                 level,
                 parent_db,
                 _centroid_to_bytes(r.get("centroid")),
-                json.dumps(r.get("keystone_cards")) if r.get("keystone_cards") else None,
+                psycopg2.extras.Json(r["keystone_cards"]) if r.get("keystone_cards") else None,
                 r["member_count"],
                 run_id,
             ))
@@ -97,7 +96,6 @@ def write_archetypes(
         for r, db_id in zip(level_records, db_ids):
             local_to_db[(level, r["local_id"])] = db_id
 
-    conn.commit()
     print(f"  Wrote {len(records)} archetype records")
     return local_to_db
 
@@ -127,5 +125,4 @@ def write_assignments(
                 """,
                 batch,
             )
-    conn.commit()
     print(f"  Wrote {len(assignments):,} deck assignments")

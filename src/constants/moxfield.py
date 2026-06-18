@@ -21,10 +21,11 @@ CLAIM_TIMEOUT_MINUTES = 30
 
 COLOR_BITS: dict[str, int] = {"W": 1, "U": 2, "B": 4, "R": 8, "G": 16}
 
-LEGAL_FORMATS: list[str] = [
-    "commander", "pauper", "standard", "modern", "vintage", "legacy",
-    "highlanderCanadian",
-]
+SINGLETON_FORMATS: list[str] = ["commander", "highlanderCanadian"]
+REGULAR_FORMATS: list[str] = ["pauper", "standard", "modern", "vintage", "legacy"]
+ALL_FORMATS: list[str] = SINGLETON_FORMATS + REGULAR_FORMATS
+
+LEGAL_FORMATS = ALL_FORMATS  # backward-compat alias
 
 BOARDS: list[str] = [
     "commanders", "companions", "signatureSpells",

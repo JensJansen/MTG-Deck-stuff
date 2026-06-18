@@ -2,7 +2,8 @@
 import os
 import pytest
 from constants.moxfield import (
-    COLOR_BITS, DEFAULT_BOARDS, LEGAL_FORMATS,
+    COLOR_BITS, DEFAULT_BOARDS,
+    SINGLETON_FORMATS, REGULAR_FORMATS, ALL_FORMATS, LEGAL_FORMATS,
     encode_colors, moxfield_search_name, parse_deck,
 )
 
@@ -133,11 +134,32 @@ class TestParseDeck:
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 class TestConstants:
+    def test_singleton_formats_exact(self):
+        assert SINGLETON_FORMATS == ["commander", "highlanderCanadian"]
+
+    def test_regular_formats_exact(self):
+        assert REGULAR_FORMATS == ["pauper", "standard", "modern", "vintage", "legacy"]
+
+    def test_all_formats_is_singleton_plus_regular(self):
+        assert ALL_FORMATS == SINGLETON_FORMATS + REGULAR_FORMATS
+
+    def test_legal_formats_is_alias_for_all_formats(self):
+        assert LEGAL_FORMATS is ALL_FORMATS
+
     def test_legal_formats_exact(self):
         assert LEGAL_FORMATS == [
-            "commander", "pauper", "standard", "modern",
-            "vintage", "legacy", "highlanderCanadian",
+            "commander", "highlanderCanadian",
+            "pauper", "standard", "modern", "vintage", "legacy",
         ]
+
+    def test_legal_formats_has_highlander(self):
+        assert "highlanderCanadian" in LEGAL_FORMATS
+
+    def test_singleton_formats_are_prefix_of_all(self):
+        assert ALL_FORMATS[:len(SINGLETON_FORMATS)] == SINGLETON_FORMATS
+
+    def test_regular_formats_are_suffix_of_all(self):
+        assert ALL_FORMATS[len(SINGLETON_FORMATS):] == REGULAR_FORMATS
 
     def test_default_boards_exact(self):
         assert DEFAULT_BOARDS == frozenset({"mainboard", "commanders", "companions", "signatureSpells"})
@@ -147,9 +169,6 @@ class TestConstants:
 
     def test_default_boards_is_frozenset(self):
         assert isinstance(DEFAULT_BOARDS, frozenset)
-
-    def test_legal_formats_has_highlander(self):
-        assert "highlanderCanadian" in LEGAL_FORMATS
 
 
 # ── load_env ──────────────────────────────────────────────────────────────────

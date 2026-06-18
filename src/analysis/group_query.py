@@ -24,7 +24,9 @@ import psycopg2
 from constants.env import load_env
 from constants.moxfield import DEFAULT_BOARDS
 from query import SORT_CHOICES, resolve_card_name
+
 DEFAULT_LIMIT  = 30
+_SORT_COL_SAFE: dict[str, str] = {c: c for c in SORT_CHOICES}
 
 
 # ---------------------------------------------------------------------------
@@ -89,16 +91,12 @@ def query_group_stats(
     if n_group == 0:
         return n_total, 0, []
 
-    # Round-trip 2: full co-occurrence stats computed in Postgres
+    # Round-trip 2: full co-occurrence stats computed in Postgres.
+    # n_total is passed as a literal from round-trip 1 to avoid recomputing it.
+    col = _SORT_COL_SAFE[sort_by]
     with conn.cursor() as cur:
         cur.execute(f"""
             WITH
-            n_total AS (
-                SELECT COUNT(DISTINCT dc.deck_id) AS n
-                FROM deck_cards dc
-                JOIN decks d ON dc.deck_id = d.public_id
-                WHERE d.format = %s AND dc.board = ANY(%s)
-            ),
             group_decks AS (
                 SELECT dc.deck_id
                 FROM deck_cards dc
@@ -136,15 +134,15 @@ def query_group_stats(
             FROM cooccur co
             JOIN card_totals ct ON co.card_id = ct.card_id
             JOIN cards c        ON co.card_id = c.id
-            CROSS JOIN n_total nt
+            CROSS JOIN (SELECT %s::bigint AS n) nt
             CROSS JOIN n_group ng
-            ORDER BY {sort_by} DESC
+            ORDER BY {col} DESC
             LIMIT %s
         """, (
-            fmt, boards_list,                              # n_total
             fmt, boards_list, group_ids, len(group_ids),  # group_decks
             boards_list, group_ids,                        # cooccur
             fmt, boards_list,                              # card_totals
+            n_total,                                       # nt literal
             limit,
         ))
         cols = [d[0] for d in cur.description]

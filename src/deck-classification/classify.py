@@ -45,38 +45,44 @@ def _centroid_from_bytes(blob: bytes | None) -> np.ndarray | None:
 class DeckClassifier:
     def __init__(self, fmt: str, db_url: str = DATABASE_URL) -> None:
         self.fmt    = fmt
-        self.db_url = db_url
+        self._conn  = psycopg2.connect(db_url)
         self._l1_archetypes: list[dict] = []
         self._l2_archetypes: list[dict] = []
         self._card_embeddings: np.ndarray | None = None
         self._name_to_idx: dict[str, int] = {}
         self._load_archetypes()
 
+    def close(self) -> None:
+        if self._conn and not self._conn.closed:
+            self._conn.close()
+
+    def __enter__(self) -> "DeckClassifier":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
     def _load_archetypes(self) -> None:
-        conn = psycopg2.connect(self.db_url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, level, parent_id, centroid, keystone_cards, member_count
-                    FROM archetypes
-                    WHERE format = %s
-                    ORDER BY level, id
-                """, (self.fmt,))
-                for row in cur.fetchall():
-                    record = {
-                        "id":           row[0],
-                        "level":        row[1],
-                        "parent_id":    row[2],
-                        "centroid":     _centroid_from_bytes(row[3]),
-                        "keystones":    row[4] or [],
-                        "member_count": row[5],
-                    }
-                    if row[1] == 1:
-                        self._l1_archetypes.append(record)
-                    else:
-                        self._l2_archetypes.append(record)
-        finally:
-            conn.close()
+        with self._conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, level, parent_id, centroid, keystone_cards, member_count
+                FROM archetypes
+                WHERE format = %s
+                ORDER BY level, id
+            """, (self.fmt,))
+            for row in cur.fetchall():
+                record = {
+                    "id":           row[0],
+                    "level":        row[1],
+                    "parent_id":    row[2],
+                    "centroid":     _centroid_from_bytes(row[3]),
+                    "keystones":    row[4] or [],
+                    "member_count": row[5],
+                }
+                if row[1] == 1:
+                    self._l1_archetypes.append(record)
+                else:
+                    self._l2_archetypes.append(record)
 
         print(f"Loaded {len(self._l1_archetypes)} L1 and {len(self._l2_archetypes)} L2 archetypes for {self.fmt!r}")
 
@@ -93,13 +99,11 @@ class DeckClassifier:
 
     def _load_embeddings(self) -> None:
         try:
-            import sys
-            from pathlib import Path
             sys.path.insert(0, str(Path(__file__).parents[1] / "deck-builder"))
             import vocabulary as voc
             import torch
             from model import DeckTransformer
-            from config import DECK_BUILDER_DIR, MODEL_CHECKPOINT, DATA_DIR
+            from config import DECK_BUILDER_DIR, MODEL_CHECKPOINT
 
             ckpt_path = MODEL_CHECKPOINT
             if not ckpt_path:
@@ -115,7 +119,7 @@ class DeckClassifier:
             model.load_state_dict(ckpt["model"])
             model.eval()
             self._card_embeddings = model.card_embedding.weight.detach().numpy()
-        except Exception as e:
+        except (OSError, KeyError, RuntimeError, ImportError) as e:
             print(f"  Warning: could not load embeddings ({e}). Falling back to keystone-only classification.")
 
     def _match_keystones(self, card_set: set[str], keystones: list[dict]) -> list[str]:
@@ -150,20 +154,16 @@ class DeckClassifier:
 
     def classify_deck_id(self, deck_id: str) -> dict:
         """Look up a deck from the DB by public_id and classify it."""
-        conn = psycopg2.connect(self.db_url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT c.card_name
-                    FROM deck_cards dc
-                    JOIN cards c ON c.id = dc.card_id
-                    WHERE dc.deck_id = %s
-                      AND dc.board   = 'mainboard'
-                      AND c.type_line NOT LIKE '%%Land%%'
-                """, (deck_id,))
-                card_names = [row[0] for row in cur.fetchall()]
-        finally:
-            conn.close()
+        with self._conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.card_name
+                FROM deck_cards dc
+                JOIN cards c ON c.id = dc.card_id
+                WHERE dc.deck_id = %s
+                  AND dc.board   = 'mainboard'
+                  AND c.type_line NOT LIKE '%%Land%%'
+            """, (deck_id,))
+            card_names = [row[0] for row in cur.fetchall()]
 
         if not card_names:
             return {"error": f"No mainboard cards found for deck {deck_id!r}"}

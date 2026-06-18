@@ -94,7 +94,9 @@ def load_nodes(conn, fmt: str) -> list[dict]:
     ]
 
 
-def load_ego(conn, fmt: str, card_names: set[str]) -> dict[str, list[dict]]:
+def _load_pair_rows(
+    conn, fmt: str, card_names: set[str], min_cooccur: int
+) -> list[tuple]:
     card_list = list(card_names)
     with conn.cursor() as cur:
         cur.execute("""
@@ -103,16 +105,18 @@ def load_ego(conn, fmt: str, card_names: set[str]) -> dict[str, list[dict]]:
             WHERE format = %s AND cooccurrence_count >= %s
               AND card_a = ANY(%s) AND card_b = ANY(%s)
             ORDER BY cooccurrence_count DESC
-        """, (fmt, EGO_MIN_COOCCUR, card_list, card_list))
-        rows = cur.fetchall()
+        """, (fmt, min_cooccur, card_list, card_list))
+        return cur.fetchall()
 
+
+def load_ego(conn, fmt: str, card_names: set[str]) -> dict[str, list[dict]]:
+    rows = _load_pair_rows(conn, fmt, card_names, EGO_MIN_COOCCUR)
     ego: dict[str, list] = defaultdict(list)
     for card_a, card_b, cooccur, lift, jaccard in rows:
-        if card_a in card_names and len(ego[card_a]) < EGO_TOP_N and card_b in card_names:
+        if len(ego[card_a]) < EGO_TOP_N:
             ego[card_a].append({"n": card_b, "c": cooccur, "l": round(lift, 2), "j": round(jaccard, 3)})
-        if card_b in card_names and len(ego[card_b]) < EGO_TOP_N and card_a in card_names:
+        if len(ego[card_b]) < EGO_TOP_N:
             ego[card_b].append({"n": card_a, "c": cooccur, "l": round(lift, 2), "j": round(jaccard, 3)})
-
     return dict(ego)
 
 
@@ -136,23 +140,11 @@ def load_edges(conn, fmt: str, name_to_idx: dict[str, int]) -> list[list[int]]:
 
 def load_focus(conn, fmt: str, card_names: set[str]) -> dict[str, list]:
     """All co-occurring pairs (>=FOCUS_MIN_COOCCUR) as compact [name, count, lift] tuples."""
-    card_list = list(card_names)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT card_a, card_b, cooccurrence_count, lift
-            FROM card_pair_stats
-            WHERE format = %s AND cooccurrence_count >= %s
-              AND card_a = ANY(%s) AND card_b = ANY(%s)
-            ORDER BY cooccurrence_count DESC
-        """, (fmt, FOCUS_MIN_COOCCUR, card_list, card_list))
-        rows = cur.fetchall()
-
+    rows = _load_pair_rows(conn, fmt, card_names, FOCUS_MIN_COOCCUR)
     focus: dict[str, list] = defaultdict(list)
-    for card_a, card_b, cooccur, lift in rows:
-        if card_a in card_names and card_b in card_names:
-            focus[card_a].append([card_b, cooccur, round(lift, 2)])
-            focus[card_b].append([card_a, cooccur, round(lift, 2)])
-
+    for card_a, card_b, cooccur, lift, _jaccard in rows:
+        focus[card_a].append([card_b, cooccur, round(lift, 2)])
+        focus[card_b].append([card_a, cooccur, round(lift, 2)])
     return dict(focus)
 
 
@@ -244,8 +236,8 @@ def main() -> None:
         if manifest_path.exists():
             try:
                 existing = json.loads(manifest_path.read_text())["formats"]
-            except Exception:
-                pass
+            except (json.JSONDecodeError, KeyError) as exc:
+                print(f"  [warn] manifest.json is malformed ({exc}), starting fresh")
         all_formats = sorted(set(existing) | set(exported))
         write_manifest(OUTPUT_DIR, all_formats)
         print(f"\nManifest updated: {all_formats}")

@@ -57,25 +57,25 @@ def api_claim_batch(batch_size: int, worker_id: str) -> list[dict]:
     return resp.json()
 
 
-def api_submit_cards(public_id: str, worker_id: str, cards: list[dict]) -> int:
+def api_submit_batch(submissions: list[dict]) -> list[dict]:
     """
-    Submit card rows for a processed deck.
-    Returns the number of rows written, or -1 if the deck was already done (collision).
+    Submit card rows for a batch of decks in one request.
+
+    Each entry in submissions must have: deck_id, worker_id, cards.
+    Returns a list of {deck_id, rows_written, collision} dicts.
     """
     resp = requests.post(
-        f"{SCRAPER_API_URL}/decks/{public_id}/cards",
+        f"{SCRAPER_API_URL}/decks/cards/batch",
         headers=_API_HEADERS,
-        json={"worker_id": worker_id, "cards": cards},
-        timeout=30,
+        json=submissions,
+        timeout=60,
     )
-    if resp.status_code == 409:
-        return -1
     resp.raise_for_status()
-    return resp.json()["rows_written"]
+    return resp.json()
 
 
 def api_report_error(public_id: str, worker_id: str, detail: str) -> None:
-    """Mark a deck as errored. Best-effort; ignores failures."""
+    """Mark a deck as errored. Best-effort; logs but does not raise on failure."""
     try:
         requests.post(
             f"{SCRAPER_API_URL}/decks/{public_id}/error",
@@ -83,8 +83,8 @@ def api_report_error(public_id: str, worker_id: str, detail: str) -> None:
             json={"worker_id": worker_id, "detail": detail},
             timeout=10,
         )
-    except requests.RequestException:
-        pass
+    except requests.RequestException as exc:
+        print(f"  [warn] Could not report error for {public_id}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +119,18 @@ def parse_deck_detail(detail: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def process_batch(decks: list[dict], worker_id: str) -> tuple[int, int, int]:
-    """Process a claimed batch. Returns (done, collisions, errors)."""
+    """
+    Process a claimed batch. Returns (done, collisions, errors).
+
+    Fetches all decks from Moxfield first (with rate limiting), then submits
+    all successful results to the API in a single batch request.
+    """
     done       = 0
     collisions = 0
     errors     = 0
 
+    # Phase 1: fetch card details from Moxfield
+    submissions: list[dict] = []
     for i, deck in enumerate(decks):
         public_id = deck["public_id"]
         if i > 0:
@@ -133,13 +140,13 @@ def process_batch(decks: list[dict], worker_id: str) -> tuple[int, int, int]:
         try:
             detail         = fetch_deck_detail(public_id)
             deck_card_rows = parse_deck_detail(detail)
-            n              = api_submit_cards(public_id, worker_id, deck_card_rows)
-            if n == -1:
-                print("collision — deck already processed")
-                collisions += 1
-            else:
-                print(f"done ({n} card-rows)")
-                done += 1
+            submissions.append({
+                "deck_id":   public_id,
+                "worker_id": worker_id,
+                "format":    deck["format"],
+                "cards":     deck_card_rows,
+            })
+            print("fetched", flush=True)
         except requests.HTTPError as exc:
             code = exc.response.status_code
             print(f"HTTP {code} — marking error")
@@ -149,6 +156,20 @@ def process_batch(decks: list[dict], worker_id: str) -> tuple[int, int, int]:
             print(f"request failed ({exc}) — marking error")
             api_report_error(public_id, worker_id, str(exc))
             errors += 1
+
+    if not submissions:
+        return done, collisions, errors
+
+    # Phase 2: submit all fetched decks in one batch API call
+    print(f"  Submitting {len(submissions)} deck(s) as batch ...", flush=True)
+    results = api_submit_batch(submissions)
+    for result in results:
+        if result["collision"]:
+            print(f"  {result['deck_id']}: collision — deck already processed")
+            collisions += 1
+        else:
+            print(f"  {result['deck_id']}: done ({result['rows_written']} card-rows)")
+            done += 1
 
     return done, collisions, errors
 
@@ -169,8 +190,12 @@ def run_loop(batch_size: int, worker_id: str, once: bool, delay: float) -> None:
             continue
 
         if not decks:
-            print("No claimable decks — exiting.")
-            break
+            if once:
+                print("No claimable decks.")
+                break
+            print(f"No claimable decks — sleeping {delay:.0f}s ...")
+            time.sleep(delay)
+            continue
 
         print(f"\nClaimed {len(decks)} deck(s):")
         done, collisions, errors = process_batch(decks, worker_id)

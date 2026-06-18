@@ -111,14 +111,14 @@ class ScryfallClient:
         resp = self._session.get(url, timeout=300)
         resp.raise_for_status()
 
-        raw = resp.content
-        cards = json.loads(raw)
-
         if cache_path:
-            Path(cache_path).write_bytes(raw)
+            Path(cache_path).write_bytes(resp.content)
             print(f"Saved to {cache_path}")
+            del resp
+            with open(cache_path, encoding="utf-8") as fh:
+                return json.load(fh)
 
-        return cards
+        return resp.json()
 
     def download_oracle_cards(self, cache_path: Path | None = None) -> list[dict]:
         """One card object per unique Oracle identity (~27k cards)."""

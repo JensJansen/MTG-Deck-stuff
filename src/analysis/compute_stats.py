@@ -35,15 +35,18 @@ def get_scraped_formats(conn, fmt_filter: str | None) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
-def _print_sample(conn, fmt: str) -> None:
+_SAMPLE_LIMIT = 5
+
+
+def _print_sample(conn, fmt: str, limit: int = _SAMPLE_LIMIT) -> None:
     with conn.cursor() as cur:
         cur.execute("""
             SELECT card_a, card_b, cooccurrence_count, lift, jaccard
             FROM   card_pair_stats
             WHERE  format = %s
             ORDER  BY lift DESC
-            LIMIT  5
-        """, (fmt,))
+            LIMIT  %s
+        """, (fmt, limit))
         rows = cur.fetchall()
     if rows:
         print("  top pairs by lift:")

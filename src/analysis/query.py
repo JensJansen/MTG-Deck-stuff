@@ -24,6 +24,8 @@ from constants.env import load_env
 
 SORT_CHOICES = ["lift", "pmi", "jaccard", "confidence", "cooccurrence_count"]
 
+_SORT_COL_SAFE: dict[str, str] = {c: c for c in SORT_CHOICES}
+
 
 # ---------------------------------------------------------------------------
 # Name resolution
@@ -122,6 +124,7 @@ def pair_stats(
         params.append(fmt)
     params.append(limit)
 
+    col = _SORT_COL_SAFE[sort_by]
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT
@@ -137,7 +140,7 @@ def pair_stats(
             FROM card_pair_stats
             WHERE (card_a = %s OR card_b = %s)
             {fmt_clause}
-            ORDER BY {sort_by} DESC
+            ORDER BY {col} DESC
             LIMIT %s
         """, params)
         cols = [d[0] for d in cur.description]

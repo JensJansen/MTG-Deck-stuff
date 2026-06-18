@@ -46,3 +46,18 @@ class TestStructural:
         # encode_colors from constants.moxfield should be imported, not a local copy
         from constants.moxfield import encode_colors as canonical
         assert visualize.encode_colors is canonical
+
+    def test_load_pair_rows_helper_exists(self):
+        # Shared helper introduced to eliminate duplicate query logic in load_ego/load_focus
+        assert hasattr(visualize, "_load_pair_rows"), \
+            "_load_pair_rows shared helper should exist"
+        assert callable(visualize._load_pair_rows)
+
+    def test_load_ego_and_load_focus_exist(self):
+        assert hasattr(visualize, "load_ego") and callable(visualize.load_ego)
+        assert hasattr(visualize, "load_focus") and callable(visualize.load_focus)
+
+    def test_ego_and_focus_constants_defined(self):
+        assert visualize.EGO_TOP_N > 0
+        assert visualize.EGO_MIN_COOCCUR > 0
+        assert visualize.FOCUS_MIN_COOCCUR > 0

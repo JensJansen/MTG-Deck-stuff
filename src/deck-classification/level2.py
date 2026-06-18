@@ -91,7 +91,6 @@ def run(
         cluster_id: {
             "eligible":         bool,   # True if enough variable cards were found
             "n_subclusters":    int,    # 0 if not split or no meaningful split found
-            "variable_cards":   list[str],
             "sub_labels":       np.ndarray (shape = cluster_size),  # -1 = noise
             "sub_probs":        np.ndarray,
             "deck_indices":     np.ndarray,  # indices into the original deck array
@@ -115,7 +114,6 @@ def run(
             results[cid] = {
                 "eligible":       False,
                 "n_subclusters":  0,
-                "variable_cards": var_cards,
                 "sub_labels":     np.full(parent_size, -1, dtype=np.int32),
                 "sub_probs":      np.zeros(parent_size, dtype=np.float32),
                 "deck_indices":   deck_indices,
@@ -138,7 +136,6 @@ def run(
         results[cid] = {
             "eligible":       True,
             "n_subclusters":  n_sub,
-            "variable_cards": var_cards,
             "sub_labels":     sub_labels,
             "sub_probs":      sub_probs,
             "deck_indices":   deck_indices,

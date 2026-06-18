@@ -41,7 +41,7 @@ def _compute_or_load_features(fmt: str, conn, recompute: bool):
     checkpoint = os.environ.get("MODEL_CHECKPOINT", MODEL_CHECKPOINT)
     if checkpoint and (recompute or not cached["embeddings"]):
         print("\n── Features: embeddings ──────────────────────────────────────────")
-        deck_ids   = feat._load_deck_ids(conn, fmt)
+        deck_ids   = feat.load_deck_ids(conn, fmt)
         embeddings = feat.compute_embeddings(deck_ids, conn, fmt, checkpoint)
         feat.save_embeddings(fmt, deck_ids, embeddings)
     elif cached["embeddings"]:
@@ -49,14 +49,12 @@ def _compute_or_load_features(fmt: str, conn, recompute: bool):
         deck_ids, embeddings = feat.load_embeddings(fmt)
     else:
         print("  No MODEL_CHECKPOINT set and no cached embeddings — using card presence only")
-        deck_ids   = feat._load_deck_ids(conn, fmt)
+        deck_ids   = feat.load_deck_ids(conn, fmt)
         embeddings = None
 
     # ── Structural features (pip volume, CMC) ──────────────────────────────────
     if recompute or not cached["features"]:
         print("\n── Features: pip volumes + CMC distributions ─────────────────────")
-        if embeddings is None:
-            deck_ids = feat._load_deck_ids(conn, fmt)
         pip_volumes, cmc_dists = feat.compute_structural_features(deck_ids, conn, fmt)
         feat.save_structural(fmt, deck_ids, pip_volumes, cmc_dists)
     else:
@@ -157,10 +155,12 @@ def run(fmt: str, recompute: bool = False) -> None:
 
         del embeddings
 
-        # ── 6. Persist ─────────────────────────────────────────────────────────
+        # ── 6. Persist — single transaction so a write failure never leaves
+        #       archetypes deleted without replacements being committed.
         print("\n── Storing results ───────────────────────────────────────────────")
-        store.clear_format(conn, fmt)
-        local_to_db = store.write_archetypes(conn, fmt, run_id, archetype_records)
+        try:
+            store.clear_format(conn, fmt)
+            local_to_db = store.write_archetypes(conn, fmt, run_id, archetype_records)
 
         # Build assignment rows for every deck that received a label
         for global_idx, deck_id in enumerate(deck_ids):
@@ -182,7 +182,11 @@ def run(fmt: str, recompute: bool = False) -> None:
                         if l2_db_id:
                             assignments.append((deck_id, l2_db_id, 2, float(l2["sub_probs"][local_pos])))
 
-        store.write_assignments(conn, assignments)
+            store.write_assignments(conn, assignments)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         # ── Summary ────────────────────────────────────────────────────────────
         n_l1     = sum(1 for r in archetype_records if r["level"] == 1)

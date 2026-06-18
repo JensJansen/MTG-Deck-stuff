@@ -22,6 +22,7 @@ import array
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -59,7 +60,7 @@ def _parse_pips(mana_cost: str | None) -> list[int]:
 
 # ── Database queries ───────────────────────────────────────────────────────────
 
-def _load_deck_ids(conn, fmt: str) -> list[str]:
+def load_deck_ids(conn, fmt: str) -> list[str]:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT public_id FROM decks WHERE format = %s AND status = 'done' ORDER BY public_id",
@@ -92,7 +93,7 @@ def _stream_deck_cards(conn, fmt: str):
     Yields (public_id, card_name) for all non-land mainboard cards in done
     decks of the given format, ordered by public_id.
     """
-    with conn.cursor(name="card_stream", withhold=True) as cur:
+    with conn.cursor(name=f"card_stream_{uuid.uuid4().hex[:8]}", withhold=True) as cur:
         cur.itersize = 100_000
         cur.execute("""
             SELECT d.public_id, c.card_name

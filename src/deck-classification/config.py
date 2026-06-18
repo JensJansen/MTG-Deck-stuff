@@ -1,13 +1,16 @@
 import os
+from pathlib import Path
 
 # ── Database ───────────────────────────────────────────────────────────────────
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://postgres:password@localhost/deckgen"
-)
+# Always set DATABASE_URL in the environment; the fallback is a dev convenience only.
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:password@localhost/deckgen")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-DATA_DIR         = os.environ.get("DATA_DIR",         "data")
-DECK_BUILDER_DIR = os.environ.get("DECK_BUILDER_DIR", "../deck-builder")
+DATA_DIR         = os.environ.get("DATA_DIR", "data")
+DECK_BUILDER_DIR = os.environ.get(
+    "DECK_BUILDER_DIR",
+    str(Path(__file__).parent.parent / "deck-builder"),
+)
 
 # Path to a trained DeckTransformer checkpoint. Used by features.py to compute
 # deck embeddings. Set to None to skip embedding-based features (uses card

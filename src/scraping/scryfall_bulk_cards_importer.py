@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import psycopg2
 import psycopg2.extras
 
-from constants.moxfield import LEGAL_FORMATS, encode_colors
+from constants.moxfield import LEGAL_FORMATS, REGULAR_FORMATS, encode_colors
 from constants.env import load_env
 from scryfall import ScryfallClient
 
@@ -133,7 +133,7 @@ def import_cards(cards: list[dict], conn) -> tuple[int, int]:
         for raw in batch:
             try:
                 rows.append(parse_card(raw))
-            except Exception as exc:
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 print(f"  [warn] parse error for {raw.get('name', '?')!r}: {exc}")
                 errors += 1
 
@@ -177,10 +177,11 @@ def print_db_stats(conn) -> None:
         for layout, n in cur.fetchall():
             print(f"  {layout or '(none)':<20} {n:>7,}")
 
+        _sample_fmt = REGULAR_FORMATS[0]
         cur.execute(
-            "SELECT legal_pauper, COUNT(*) AS n FROM cards GROUP BY legal_pauper ORDER BY n DESC"
+            f"SELECT legal_{_sample_fmt}, COUNT(*) AS n FROM cards GROUP BY legal_{_sample_fmt} ORDER BY n DESC"
         )
-        print("\nLegality sample (pauper):")
+        print(f"\nLegality sample ({_sample_fmt}):")
         for status, n in cur.fetchall():
             print(f"  {status or '(null)':<15} {n:>7,}")
 
