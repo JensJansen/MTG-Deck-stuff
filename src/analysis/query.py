@@ -16,38 +16,13 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parents[1]))
+
 import psycopg2
 
+from constants.env import load_env
+
 SORT_CHOICES = ["lift", "pmi", "jaccard", "confidence", "cooccurrence_count"]
-
-# ---------------------------------------------------------------------------
-# .env loader
-# ---------------------------------------------------------------------------
-
-_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
-
-_ENV_TEMPLATE = """\
-DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
-API_KEY=your-api-key
-SCRAPER_API_URL=http://127.0.0.1:8000
-"""
-
-
-def _load_env() -> None:
-    if not _ENV_FILE.exists():
-        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _ENV_FILE.write_text(_ENV_TEMPLATE)
-        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
-        return
-    for line in _ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +114,6 @@ def pair_stats(
     sort_by: str,
     limit: int,
 ) -> list[dict]:
-    sort_col = "confidence" if sort_by == "confidence" else sort_by
     fmt_clause = "AND format = %s" if fmt else ""
 
     # card_name repeated 4x: two CASE expressions + two WHERE conditions
@@ -163,7 +137,7 @@ def pair_stats(
             FROM card_pair_stats
             WHERE (card_a = %s OR card_b = %s)
             {fmt_clause}
-            ORDER BY {sort_col} DESC
+            ORDER BY {sort_by} DESC
             LIMIT %s
         """, params)
         cols = [d[0] for d in cur.description]
@@ -248,7 +222,7 @@ def main() -> None:
                         help="Number of pairs to show (default: 30)")
     args = parser.parse_args()
 
-    _load_env()
+    load_env()
 
     pg_url = os.environ.get("DATABASE_URL")
     if not pg_url:

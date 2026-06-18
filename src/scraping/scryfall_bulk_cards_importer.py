@@ -24,39 +24,11 @@ import psycopg2
 import psycopg2.extras
 
 from constants.moxfield import LEGAL_FORMATS, encode_colors
+from constants.env import load_env
 from scryfall import ScryfallClient
 
 CACHE_DIR  = Path(__file__).parents[1] / "data" / "cache"
 BATCH_SIZE = 500
-
-# ---------------------------------------------------------------------------
-# .env loader
-# ---------------------------------------------------------------------------
-
-_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
-
-_ENV_TEMPLATE = """\
-DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
-API_KEY=your-api-key
-SCRAPER_API_URL=http://127.0.0.1:8000
-"""
-
-
-def _load_env() -> None:
-    if not _ENV_FILE.exists():
-        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _ENV_FILE.write_text(_ENV_TEMPLATE)
-        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
-        return
-    for line in _ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
 
 # Columns written to Postgres in insertion order.
 # 'card_name' maps from Scryfall's 'name' field.
@@ -245,7 +217,7 @@ Examples:
     )
     args = parser.parse_args()
 
-    _load_env()
+    load_env()
 
     pg_url = os.environ.get("DATABASE_URL")
     if not pg_url:

@@ -33,7 +33,8 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import psycopg2
 
-from constants.moxfield import COLOR_BITS
+from constants.moxfield import encode_colors
+from constants.env import load_env
 
 OUTPUT_DIR = Path(__file__).parent / "public" / "data"
 
@@ -41,12 +42,6 @@ EGO_TOP_N         = 50
 EGO_MIN_COOCCUR   = 5
 GRAPH_MIN_COOCCUR = 20
 FOCUS_MIN_COOCCUR = 5
-
-
-def color_mask_from_identity(color_identity: str) -> int:
-    if not color_identity:
-        return 0
-    return sum(COLOR_BITS.get(c.strip(), 0) for c in color_identity.split(",") if c.strip())
 
 
 def categorize_color(color_identity: str) -> str:
@@ -57,40 +52,10 @@ def categorize_color(color_identity: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# .env loader
-# ---------------------------------------------------------------------------
-
-_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
-
-_ENV_TEMPLATE = """\
-DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
-API_KEY=your-api-key
-SCRAPER_API_URL=http://127.0.0.1:8000
-"""
-
-
-def _load_env() -> None:
-    if not _ENV_FILE.exists():
-        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _ENV_FILE.write_text(_ENV_TEMPLATE)
-        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
-        return
-    for line in _ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-# ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def get_formats(conn, fmt_filter: str | None) -> list[str]:
+def get_layout_formats(conn, fmt_filter: str | None) -> list[str]:
     if fmt_filter:
         return [fmt_filter]
     with conn.cursor() as cur:
@@ -118,7 +83,7 @@ def load_nodes(conn, fmt: str) -> list[dict]:
             "x":             r[1],
             "y":             r[2],
             "color_cat":     categorize_color(r[3]),
-            "color_mask":    color_mask_from_identity(r[3]),
+            "color_mask":    encode_colors(r[3]),
             "deck_count":    r[4],
             "total_decks":   r[5],
             "inclusion_pct": round(r[6] * 100, 1),
@@ -247,7 +212,7 @@ def main() -> None:
                         help="Limit to one format (default: all with layout data)")
     args = parser.parse_args()
 
-    _load_env()
+    load_env()
 
     pg_url = os.environ.get("DATABASE_URL")
     if not pg_url:
@@ -257,7 +222,7 @@ def main() -> None:
     conn = psycopg2.connect(pg_url)
 
     try:
-        formats = get_formats(conn, args.format)
+        formats = get_layout_formats(conn, args.format)
         if not formats:
             print("No layout data found — run precompute_layout.py first.")
             return

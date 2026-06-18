@@ -15,13 +15,15 @@ Reads DATABASE_URL from src/distributed scraper/.env automatically.
 import argparse
 import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import psycopg2
 
-from query import _load_env, resolve_card_name
-
-DEFAULT_BOARDS = frozenset({"mainboard", "commanders", "companions", "signatureSpells"})
-SORT_CHOICES   = ["lift", "pmi", "jaccard", "confidence", "cooccurrence_count"]
+from constants.env import load_env
+from constants.moxfield import DEFAULT_BOARDS
+from query import SORT_CHOICES, resolve_card_name
 DEFAULT_LIMIT  = 30
 
 
@@ -262,7 +264,7 @@ def main() -> None:
                         help="Also count sideboard cards")
     args = parser.parse_args()
 
-    _load_env()
+    load_env()
 
     pg_url = os.environ.get("DATABASE_URL")
     if not pg_url:

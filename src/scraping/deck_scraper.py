@@ -39,38 +39,10 @@ import psycopg2.extras
 import requests
 
 from constants.moxfield import (
-    API_DECK, API_SEARCH, BOARDS, HEADERS, LEGAL_FORMATS, RATE_LIMIT_SECONDS, encode_colors,
+    API_DECK, API_SEARCH, BOARDS, HEADERS, LEGAL_FORMATS, RATE_LIMIT_SECONDS,
+    moxfield_search_name, parse_deck,
 )
-
-
-# ---------------------------------------------------------------------------
-# .env loader
-# ---------------------------------------------------------------------------
-
-_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
-
-_ENV_TEMPLATE = """\
-DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
-API_KEY=your-api-key
-SCRAPER_API_URL=http://127.0.0.1:8000
-"""
-
-
-def _load_env() -> None:
-    if not _ENV_FILE.exists():
-        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _ENV_FILE.write_text(_ENV_TEMPLATE)
-        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
-        return
-    for line in _ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
+from constants.env import load_env
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +153,6 @@ def get_cards_for_mode(conn, card: str | None, fmt: str | None) -> list[str]:
         return [row[0] for row in cur.fetchall()]
 
 
-def moxfield_search_name(card_name: str) -> str:
-    """For DFCs stored as 'Front // Back', Moxfield expects only the front face."""
-    return card_name.split(" // ")[0] if " // " in card_name else card_name
-
-
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
@@ -210,21 +177,6 @@ def fetch_deck_detail(public_id: str) -> dict:
     resp = requests.get(API_DECK.format(public_id=public_id), headers=HEADERS, timeout=15)
     resp.raise_for_status()
     return resp.json()
-
-
-def parse_deck(raw: dict, fmt: str | None) -> dict:
-    colors = raw.get("colorIdentity") or raw.get("colors") or []
-    public_id = raw.get("publicId") or raw.get("id") or raw.get("slug")
-    return {
-        "public_id":      public_id,
-        "name":           raw.get("name"),
-        "format":         raw.get("format") or fmt,
-        "author":         (raw.get("createdByUser") or {}).get("userName") or raw.get("authorUserName"),
-        "color_mask":     encode_colors(colors),
-        "created_at_utc": raw.get("createdAtUtc"),
-        "updated_at_utc": raw.get("lastUpdatedAtUtc"),
-        "scraped_at":     datetime.now(timezone.utc).isoformat(),
-    }
 
 
 def parse_deck_detail(detail: dict) -> list[dict]:
@@ -396,7 +348,7 @@ Examples:
 
     args = parser.parse_args()
 
-    _load_env()
+    load_env()
 
     pg_url = os.environ.get("DATABASE_URL")
     if not pg_url:

@@ -14,14 +14,18 @@ Reads DATABASE_URL from src/distributed scraper/.env automatically.
 
 import argparse
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import psycopg2
 import psycopg2.extras
 import umap
 from scipy.sparse import csr_matrix
 
-_COLOR_BITS = {"W": 1, "U": 2, "B": 4, "R": 8, "G": 16}
+from constants.env import load_env
+from constants.moxfield import COLOR_BITS
 
 DEFAULT_MIN_DECKS   = 5
 DEFAULT_MIN_COOCCUR = 20
@@ -30,40 +34,10 @@ DEFAULT_MIN_COOCCUR = 20
 def decode_colors(mask: int) -> str:
     if not mask:
         return ""
-    return ",".join(c for c, bit in _COLOR_BITS.items() if mask & bit)
+    return ",".join(c for c, bit in COLOR_BITS.items() if mask & bit)
 
 
-# ---------------------------------------------------------------------------
-# .env loader
-# ---------------------------------------------------------------------------
-
-_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
-
-_ENV_TEMPLATE = """\
-DATABASE_URL=postgresql://postgres:yourpassword@localhost/deckgen
-API_KEY=your-api-key
-SCRAPER_API_URL=http://127.0.0.1:8000
-"""
-
-
-def _load_env() -> None:
-    if not _ENV_FILE.exists():
-        _ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _ENV_FILE.write_text(_ENV_TEMPLATE)
-        print(f"Created {_ENV_FILE} with placeholder values — please fill in real credentials.")
-        return
-    for line in _ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-def get_formats(conn, fmt_filter: str | None) -> list[str]:
+def get_stats_formats(conn, fmt_filter: str | None) -> list[str]:
     if fmt_filter:
         return [fmt_filter]
     with conn.cursor() as cur:
@@ -220,7 +194,7 @@ def main() -> None:
                         help=f"Minimum co-occurrence count for layout edges (default: {DEFAULT_MIN_COOCCUR})")
     args = parser.parse_args()
 
-    _load_env()
+    load_env()
 
     pg_url = os.environ.get("DATABASE_URL")
     if not pg_url:
@@ -230,7 +204,7 @@ def main() -> None:
     conn = psycopg2.connect(pg_url)
 
     try:
-        formats = get_formats(conn, args.format)
+        formats = get_stats_formats(conn, args.format)
         if not formats:
             print("No formats found — run compute_stats.py first.")
             return

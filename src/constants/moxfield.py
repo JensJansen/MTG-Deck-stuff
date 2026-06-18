@@ -1,9 +1,11 @@
 """
-Shared Moxfield API constants and MTG format/color constants.
+Shared Moxfield API constants, MTG format/color constants, and parsing utilities.
 
 Used by both the single-machine scraper (src/scraping/) and the
 distributed scraper (src/distributed scraper/).
 """
+
+from datetime import datetime, timezone
 
 API_SEARCH = "https://api2.moxfield.com/v2/decks/search"
 API_DECK   = "https://api2.moxfield.com/v2/decks/all/{public_id}"
@@ -29,6 +31,10 @@ BOARDS: list[str] = [
     "mainboard", "sideboard", "maybeboard", "attractions", "stickers",
 ]
 
+# Boards counted as part of the constructed deck for analysis purposes.
+# Excludes sideboard, maybeboard, attractions, and stickers.
+DEFAULT_BOARDS: frozenset[str] = frozenset({"mainboard", "commanders", "companions", "signatureSpells"})
+
 
 def encode_colors(colors: list | str | None) -> int:
     if isinstance(colors, str):
@@ -37,3 +43,24 @@ def encode_colors(colors: list | str | None) -> int:
     for c in (colors or []):
         mask |= COLOR_BITS.get(str(c).strip().upper(), 0)
     return mask
+
+
+def moxfield_search_name(card_name: str) -> str:
+    """For DFCs stored as 'Front // Back', Moxfield expects only the front face."""
+    return card_name.split(" // ")[0] if " // " in card_name else card_name
+
+
+def parse_deck(raw: dict, fmt: str | None) -> dict:
+    """Parse a single deck entry from a Moxfield search result into a DB-ready dict."""
+    colors    = raw.get("colorIdentity") or raw.get("colors") or []
+    public_id = raw.get("publicId") or raw.get("id") or raw.get("slug")
+    return {
+        "public_id":      public_id,
+        "name":           raw.get("name"),
+        "format":         raw.get("format") or fmt,
+        "author":         (raw.get("createdByUser") or {}).get("userName") or raw.get("authorUserName"),
+        "color_mask":     encode_colors(colors),
+        "created_at_utc": raw.get("createdAtUtc"),
+        "updated_at_utc": raw.get("lastUpdatedAtUtc"),
+        "scraped_at":     datetime.now(timezone.utc).isoformat(),
+    }

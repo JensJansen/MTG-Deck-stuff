@@ -26,7 +26,6 @@ Environment:
 
 import argparse
 import time
-from datetime import datetime, timezone
 
 import requests
 
@@ -37,7 +36,8 @@ from config import (
     RATE_LIMIT_SECONDS,
     SCRAPER_API_KEY,
     SCRAPER_API_URL,
-    encode_colors,
+    moxfield_search_name,
+    parse_deck,
 )
 
 _API_HEADERS = {"X-Api-Key": SCRAPER_API_KEY}
@@ -89,26 +89,6 @@ def fetch_page(fmt: str | None, page: int, page_size: int, card_name: str | None
     resp = requests.get(API_SEARCH, headers=MOXFIELD_HEADERS, params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
-
-
-def parse_deck(raw: dict, fmt: str | None) -> dict:
-    colors    = raw.get("colorIdentity") or raw.get("colors") or []
-    public_id = raw.get("publicId") or raw.get("id") or raw.get("slug")
-    return {
-        "public_id":      public_id,
-        "name":           raw.get("name"),
-        "format":         raw.get("format") or fmt,
-        "author":         (raw.get("createdByUser") or {}).get("userName") or raw.get("authorUserName"),
-        "color_mask":     encode_colors(colors),
-        "created_at_utc": raw.get("createdAtUtc"),
-        "updated_at_utc": raw.get("lastUpdatedAtUtc"),
-        "scraped_at":     datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def moxfield_search_name(card_name: str) -> str:
-    """Strip the back-face name from double-faced cards for Moxfield search."""
-    return card_name.split(" // ")[0] if " // " in card_name else card_name
 
 
 # ---------------------------------------------------------------------------

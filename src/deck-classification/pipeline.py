@@ -22,6 +22,7 @@ import numpy as np
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import features as feat
 import keystone
@@ -29,21 +30,7 @@ import level1
 import level2
 import store
 from config import DATA_DIR, DATABASE_URL, MODEL_CHECKPOINT
-
-_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
-
-
-def _load_env() -> None:
-    if not _ENV_FILE.exists():
-        return
-    for line in _ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value.strip()
+from constants.env import load_env
 
 
 def _compute_or_load_features(fmt: str, conn, recompute: bool):
@@ -89,7 +76,7 @@ def _compute_or_load_features(fmt: str, conn, recompute: bool):
 
 
 def run(fmt: str, recompute: bool = False) -> None:
-    _load_env()
+    load_env()
     db_url  = os.environ.get("DATABASE_URL", DATABASE_URL)
     run_id  = datetime.now(timezone.utc).isoformat()
     conn    = psycopg2.connect(db_url)
