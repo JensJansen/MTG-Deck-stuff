@@ -22,7 +22,9 @@ from tqdm import tqdm
 
 # Allow running from this directory without installing the package.
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
+from constants.env import load_env
 import vocabulary
 from config import (
     DATA_DIR,
@@ -33,22 +35,6 @@ from config import (
     PAD_IDX,
     UNK_IDX,
 )
-
-_ENV_FILE = Path(__file__).parents[1] / "distributed scraper" / ".env"
-
-
-def _load_env() -> None:
-    if not _ENV_FILE.exists():
-        return
-    for line in _ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value.strip()
-
 
 def _load_decks(conn) -> dict[str, dict]:
     """
@@ -102,7 +88,7 @@ def _encode(deck: dict, name_to_idx: dict) -> tuple[np.ndarray, np.ndarray] | No
 
 
 def main() -> None:
-    _load_env()
+    load_env()
 
     db_url = os.environ.get("DATABASE_URL", DATABASE_URL)
     os.makedirs(DATA_DIR, exist_ok=True)

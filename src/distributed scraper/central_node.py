@@ -18,6 +18,8 @@ Usage:
     python "src/distributed scraper/central_node.py" --format commander --full-sweep
     python "src/distributed scraper/central_node.py" --exclude-format pauper --exclude-format modern
     python "src/distributed scraper/central_node.py" --exclude-format vintage --reversed
+    python "src/distributed scraper/central_node.py" --format commander --start-card "Lightning Bolt"
+    python "src/distributed scraper/central_node.py" --format commander --reversed --start-card "Zur the Enchanter"
 
 Environment:
     SCRAPER_API_URL   Base URL of the scraper API (default: http://localhost:8000)
@@ -210,11 +212,26 @@ Examples:
                         help="Fetch all pages for every card, ignoring already-discovered decks")
     parser.add_argument("--reversed", dest="reversed", action="store_true",
                         help="Process cards in reverse order within each format")
+    parser.add_argument("--start-card", dest="start_card", default=None, metavar="CARD",
+                        help="Skip all cards before this one in the (possibly reversed) list")
 
     args = parser.parse_args()
 
     if args.formats and args.exclude_formats:
         parser.error("--format and --exclude-format are mutually exclusive")
+
+    def _apply_start(names: list[str], start: str | None, context: str) -> list[str] | None:
+        if not start:
+            return names
+        try:
+            idx = names.index(start)
+        except ValueError:
+            print(f"ERROR: --start-card {start!r} not found in card list for {context}")
+            return None
+        skipped = idx
+        if skipped:
+            print(f"  Skipping {skipped} card(s) before {start!r}")
+        return names[idx:]
 
     if args.card:
         card_names = [args.card]
@@ -248,6 +265,9 @@ Examples:
             continue
         if args.reversed:
             card_names = list(reversed(card_names))
+        card_names = _apply_start(card_names, args.start_card, fmt)
+        if card_names is None:
+            return
         sweep(card_names, fmt, args.page_size, args.full_sweep)
 
 

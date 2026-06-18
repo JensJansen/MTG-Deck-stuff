@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
+from constants.env import load_env  # noqa: E402
 from constants.moxfield import (  # noqa: E402
     API_SEARCH,
     API_DECK,
@@ -26,6 +27,8 @@ from constants.moxfield import (  # noqa: E402
     moxfield_search_name,
     parse_deck,
 )
+
+load_env()
 
 SCRAPER_API_URL = os.environ.get("SCRAPER_API_URL", "http://localhost:8000")
 SCRAPER_API_KEY = os.environ.get("API_KEY", "")

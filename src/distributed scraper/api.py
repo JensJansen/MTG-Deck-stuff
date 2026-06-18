@@ -28,8 +28,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from config import CLAIM_TIMEOUT_MINUTES, LEGAL_FORMATS
+from constants.env import load_env
 from db import get_connection
 
+load_env()
 
 app = FastAPI(title="Deck Scraper API", version="1.0")
 

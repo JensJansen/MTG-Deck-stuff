@@ -13,6 +13,7 @@ Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -20,21 +21,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import psycopg2
-import psycopg2.extras
 import umap
 from scipy.sparse import csr_matrix
 
 from constants.env import load_env
-from constants.moxfield import COLOR_BITS
 
 DEFAULT_MIN_DECKS   = 5
 DEFAULT_MIN_COOCCUR = 20
-
-
-def decode_colors(mask: int) -> str:
-    if not mask:
-        return ""
-    return ",".join(c for c, bit in COLOR_BITS.items() if mask & bit)
 
 
 def get_stats_formats(conn, fmt_filter: str | None) -> list[str]:
@@ -43,53 +36,6 @@ def get_stats_formats(conn, fmt_filter: str | None) -> list[str]:
     with conn.cursor() as cur:
         cur.execute("SELECT DISTINCT format FROM card_stats ORDER BY format")
         return [r[0] for r in cur.fetchall()]
-
-
-def load_cards(conn, fmt: str, min_decks: int) -> dict[str, int]:
-    """
-    Returns {card_name: deck_count} for cards above the deck threshold
-    that are legal in the given format.
-    """
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT cs.card_name, cs.deck_count
-            FROM card_stats cs
-            JOIN cards c ON cs.card_name = c.card_name
-            WHERE cs.format = %s
-              AND cs.deck_count >= %s
-              AND c.legal_{fmt} = 'legal'
-        """, (fmt, min_decks))
-        return {r[0]: r[1] for r in cur.fetchall()}
-
-
-def load_pairs(
-    conn,
-    fmt: str,
-    card_set: set[str],
-    min_cooccur: int,
-) -> list[tuple[str, str, float]]:
-    """Returns (card_a, card_b, jaccard) for pairs within card_set."""
-    card_list = list(card_set)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT card_a, card_b, jaccard
-            FROM card_pair_stats
-            WHERE format = %s
-              AND cooccurrence_count >= %s
-              AND card_a = ANY(%s)
-              AND card_b = ANY(%s)
-        """, (fmt, min_cooccur, card_list, card_list))
-        return cur.fetchall()
-
-
-def get_color_identities(conn, card_set: set[str]) -> dict[str, str]:
-    """Return the decoded color identity string for each card."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT card_name, ci_mask FROM cards WHERE card_name = ANY(%s)",
-            (list(card_set),)
-        )
-        return {r[0]: decode_colors(r[1] or 0) for r in cur.fetchall()}
 
 
 # ---------------------------------------------------------------------------
@@ -140,40 +86,41 @@ def run(conn, formats: list[str], min_decks: int, min_cooccur: int) -> None:
     for fmt in formats:
         print(f"\n[{fmt}]")
 
-        cards = load_cards(conn, fmt, min_decks)
-        if not cards:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM get_layout_cards(%s, %s)", (fmt, min_decks))
+            card_rows = cur.fetchall()
+
+        if not card_rows:
             print("  No cards meet the threshold — run compute_stats.py first.")
             continue
-        print(f"  {len(cards)} cards (deck_count >= {min_decks}, legal_{fmt} = 'legal')")
+        print(f"  {len(card_rows)} cards (deck_count >= {min_decks}, legal_{fmt} = 'legal')")
 
-        pairs = load_pairs(conn, fmt, set(cards), min_cooccur)
+        color_ids = {r[0]: r[2] for r in card_rows}
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM get_layout_pairs(%s, %s, %s)", (fmt, min_decks, min_cooccur))
+            pairs = cur.fetchall()
         print(f"  {len(pairs)} pairs (cooccurrence >= {min_cooccur})")
 
-        if len(cards) < 2:
+        if len(card_rows) < 2:
             print("  Too few cards for layout, skipping.")
             continue
 
-        print(f"  Running UMAP (n_neighbors={min(15, len(cards)-1)}, min_dist=0.05)...",
+        card_list = sorted(color_ids)
+        print(f"  Running UMAP (n_neighbors={min(15, len(card_list)-1)}, min_dist=0.05)...",
               end=" ", flush=True)
-        card_list = sorted(cards)
         pos = compute_umap_layout(card_list, pairs)
         print("done")
 
-        color_ids = get_color_identities(conn, set(cards))
-
+        layout = [
+            {"card_name": card, "x": pos[card][0], "y": pos[card][1], "color_identity": color_ids.get(card, "")}
+            for card in card_list
+            if card in pos
+        ]
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM card_layout WHERE format = %s", (fmt,))
-            psycopg2.extras.execute_values(
-                cur,
-                "INSERT INTO card_layout (card_name, format, x, y, color_identity) VALUES %s",
-                [
-                    (card, fmt, pos[card][0], pos[card][1], color_ids.get(card, ""))
-                    for card in card_list
-                    if card in pos
-                ],
-            )
+            cur.execute("CALL store_card_layout(%s, %s)", (fmt, json.dumps(layout)))
         conn.commit()
-        print(f"  Stored layout for {len(pos)} cards.")
+        print(f"  Stored layout for {len(layout)} cards.")
 
 
 # ---------------------------------------------------------------------------

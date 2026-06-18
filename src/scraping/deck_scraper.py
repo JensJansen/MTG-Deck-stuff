@@ -26,16 +26,15 @@ Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
 
 import argparse
+import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import psycopg2
-import psycopg2.extras
 import requests
 
 from constants.moxfield import (
@@ -80,42 +79,6 @@ def deck_needs_card_fetch(conn, public_id: str, updated_at_utc: str | None) -> b
     if not row or row[0] is None:
         return True
     return updated_at_utc is not None and updated_at_utc > row[1]
-
-
-def replace_deck_cards(conn, deck_id: str, deck_card_rows: list[dict]) -> None:
-    if not deck_card_rows:
-        return
-
-    names = list({r["card_name"] for r in deck_card_rows})
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT card_name, id FROM cards WHERE card_name = ANY(%s)",
-            (names,)
-        )
-        name_to_id: dict[str, int] = {row[0]: row[1] for row in cur.fetchall()}
-
-    for name in names:
-        if name not in name_to_id:
-            print(f"    [warn] card not in DB, skipping: {name!r}")
-
-    rows = [
-        (deck_id, name_to_id[r["card_name"]], r["board"], r["quantity"])
-        for r in deck_card_rows
-        if r["card_name"] in name_to_id
-    ]
-
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM deck_cards WHERE deck_id = %s", (deck_id,))
-        if rows:
-            psycopg2.extras.execute_values(
-                cur,
-                "INSERT INTO deck_cards (deck_id, card_id, board, quantity) VALUES %s",
-                rows,
-            )
-        cur.execute(
-            "UPDATE decks SET cards_fetched_at = %s, status = 'done' WHERE public_id = %s",
-            (datetime.now(timezone.utc).isoformat(), deck_id),
-        )
 
 
 def _decks_with_cards(conn, public_ids: list[str]) -> set[str]:
@@ -221,7 +184,14 @@ def _fetch_cards_for_page(raw_decks: list[dict], conn) -> int:
             continue
 
         deck_card_rows = parse_deck_detail(detail)
-        replace_deck_cards(conn, public_id, deck_card_rows)
+        if not deck_card_rows:
+            continue  # empty deck — leave status unchanged for retry
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "CALL replace_deck_cards(%s, %s)",
+                (public_id, json.dumps(deck_card_rows)),
+            )
         rows_written += len(deck_card_rows)
 
     return rows_written
