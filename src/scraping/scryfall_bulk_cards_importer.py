@@ -141,7 +141,7 @@ def parse_card(raw: dict) -> tuple:
         "keywords_json": json.dumps(raw.get("keywords") or [], ensure_ascii=False),
     }
     for fmt in LEGAL_FORMATS:
-        row[f"legal_{fmt}"] = legalities.get(fmt)
+        row[f"legal_{fmt}"] = "legal" if fmt == "highlanderCanadian" else legalities.get(fmt)
 
     return tuple(row[c] for c in COLUMNS)
 

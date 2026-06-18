@@ -104,8 +104,10 @@ def run(fmt: str, recompute: bool = False) -> None:
 
         # ── 2. Level 1 ─────────────────────────────────────────────────────────
         # Fall back to card presence matrix if no embeddings available.
-        cluster_input = embeddings if embeddings is not None else presence.toarray()
+        # Sparse matrix is passed directly — no .toarray() needed for cosine UMAP.
+        cluster_input = embeddings if embeddings is not None else presence
         reduced, l1_labels, l1_probs = level1.run(cluster_input, N, fmt)
+        del reduced
         l1_summary = level1.cluster_summary(l1_labels)
 
         # ── 3. Level 2 ─────────────────────────────────────────────────────────
@@ -165,6 +167,8 @@ def run(fmt: str, recompute: bool = False) -> None:
                         "keystone_cards": keystone_map.get((cid, sid)),
                         "member_count":   int(sub_mask.sum()),
                     })
+
+        del embeddings
 
         # ── 6. Persist ─────────────────────────────────────────────────────────
         print("\n── Storing results ───────────────────────────────────────────────")

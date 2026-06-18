@@ -13,6 +13,7 @@ disable this and fetch all pages regardless.
 Usage:
     python "src/distributed scraper/central_node.py"
     python "src/distributed scraper/central_node.py" --format pauper
+    python "src/distributed scraper/central_node.py" --format pauper --format modern --format legacy
     python "src/distributed scraper/central_node.py" --card "Lightning Bolt"
     python "src/distributed scraper/central_node.py" --format commander --full-sweep
     python "src/distributed scraper/central_node.py" --exclude-format pauper --exclude-format modern
@@ -197,73 +198,77 @@ def main() -> None:
         description="Central node: discover Moxfield decks via the scraper API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Modes (mutually exclusive):
-  --card "Name"    Search decks containing a specific card (skips API card lookup).
-  --format <fmt>   Search decks for all cards legal in that format.
-  (neither)        Search decks for every card in the cards table.
+Format selection (pick one approach):
+  --format <fmt>          Sweep one or more specific formats (repeatable).
+  --exclude-format <fmt>  Sweep all formats except these (repeatable).
+  (neither)               Sweep every format.
+
+--format and --exclude-format are mutually exclusive.
+--card bypasses format-based card lookup entirely.
 
 Examples:
   python "src/distributed scraper/central_node.py" --format pauper
+  python "src/distributed scraper/central_node.py" --format pauper --format modern --format legacy
+  python "src/distributed scraper/central_node.py" --exclude-format vintage --exclude-format oldschool
   python "src/distributed scraper/central_node.py" --card "Lightning Bolt"
   python "src/distributed scraper/central_node.py" --format commander --full-sweep
 """,
     )
 
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--card",   "-c", dest="card",   default=None)
-    mode.add_argument("--format", "-f", dest="format", default=None, choices=LEGAL_FORMATS)
+    mode.add_argument("--card", "-c", dest="card", default=None)
 
+    parser.add_argument("--format", "-f", dest="formats", action="append",
+                        default=[], choices=LEGAL_FORMATS, metavar="FORMAT",
+                        help="Format to sweep (repeatable). Cannot be combined with --exclude-format.")
+    parser.add_argument("--exclude-format", "-x", dest="exclude_formats", action="append",
+                        default=[], choices=LEGAL_FORMATS, metavar="FORMAT",
+                        help="Exclude a format from the full sweep (repeatable). Cannot be combined with --format.")
     parser.add_argument("--page-size",  dest="page_size",  type=int, default=100,
                         choices=[10, 25, 50, 64, 100])
     parser.add_argument("--full-sweep", dest="full_sweep", action="store_true",
                         help="Fetch all pages for every card, ignoring already-discovered decks")
-    parser.add_argument("--exclude-format", "-x", dest="exclude_formats", action="append",
-                        default=[], choices=LEGAL_FORMATS, metavar="FORMAT",
-                        help="Exclude a format from the full sweep (repeatable). Ignored when --format is given.")
     parser.add_argument("--reversed", dest="reversed", action="store_true",
                         help="Process cards in reverse order within each format")
 
     args = parser.parse_args()
 
+    if args.formats and args.exclude_formats:
+        parser.error("--format and --exclude-format are mutually exclusive")
+
     if args.card:
         card_names = [args.card]
         if args.reversed:
             card_names = list(reversed(card_names))
-        sweep(card_names, args.format, args.page_size, args.full_sweep)
-    elif args.format:
+        fmt = args.formats[0] if args.formats else None
+        sweep(card_names, fmt, args.page_size, args.full_sweep)
+        return
+
+    # Determine which formats to sweep.
+    if args.formats:
+        formats = args.formats
+    else:
+        formats = [f for f in LEGAL_FORMATS if f not in args.exclude_formats]
+        if args.exclude_formats:
+            print(f"Excluding formats: {', '.join(args.exclude_formats)}")
+
+    # Sweep each format independently so per-format Moxfield result pages aren't
+    # shared across formats (each gets its own 10,000-deck cap).
+    for fmt in formats:
+        print(f"\n{'='*60}")
+        print(f"Format: {fmt}")
+        print(f"{'='*60}")
         try:
-            card_names = _api_get_cards(args.format)
+            card_names = _api_get_cards(fmt)
         except requests.RequestException as exc:
             print(f"ERROR: Could not reach API at {SCRAPER_API_URL}: {exc}")
             return
         if not card_names:
-            print("No cards found. Run seed_cards.py first, then restart the API.")
-            return
+            print(f"No cards found for {fmt}, skipping.")
+            continue
         if args.reversed:
             card_names = list(reversed(card_names))
-        sweep(card_names, args.format, args.page_size, args.full_sweep)
-    else:
-        # No format specified: sweep every format independently so per-format
-        # Moxfield result pages aren't shared across formats (each gets its own
-        # 10,000-deck cap), and only cards legal in each format are searched.
-        formats = [f for f in LEGAL_FORMATS if f not in args.exclude_formats]
-        if args.exclude_formats:
-            print(f"Excluding formats: {', '.join(args.exclude_formats)}")
-        for fmt in formats:
-            print(f"\n{'='*60}")
-            print(f"Format: {fmt}")
-            print(f"{'='*60}")
-            try:
-                card_names = _api_get_cards(fmt)
-            except requests.RequestException as exc:
-                print(f"ERROR: Could not reach API at {SCRAPER_API_URL}: {exc}")
-                return
-            if not card_names:
-                print(f"No cards found for {fmt}, skipping.")
-                continue
-            if args.reversed:
-                card_names = list(reversed(card_names))
-            sweep(card_names, fmt, args.page_size, args.full_sweep)
+        sweep(card_names, fmt, args.page_size, args.full_sweep)
 
 
 if __name__ == "__main__":

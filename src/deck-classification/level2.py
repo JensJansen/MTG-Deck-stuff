@@ -70,7 +70,7 @@ def _run_hdbscan(X: np.ndarray, parent_size: int) -> tuple[np.ndarray, np.ndarra
         min_cluster_size=min_cluster_size,
         min_samples=L2_MIN_SAMPLES,
         cluster_selection_method="eom",
-        prediction_data=True,
+        prediction_data=False,
     )
     clusterer.fit(X)
     return clusterer.labels_.astype(np.int32), clusterer.probabilities_.astype(np.float32)
@@ -124,6 +124,7 @@ def run(
 
         X = _build_feature_matrix(presence, mask, col_indices, pip_volumes, cmc_dists)
         sub_labels, sub_probs = _run_hdbscan(X, parent_size)
+        del X
 
         n_sub    = int(sub_labels.max()) + 1 if sub_labels.max() >= 0 else 0
         n_noise  = int((sub_labels == -1).sum())

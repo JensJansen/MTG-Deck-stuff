@@ -58,7 +58,7 @@ def cluster(reduced: np.ndarray, n_decks: int) -> tuple[np.ndarray, np.ndarray]:
         min_cluster_size=min_cluster_size,
         min_samples=L1_MIN_SAMPLES,
         cluster_selection_method=L1_CLUSTER_METHOD,
-        prediction_data=True,      # enables soft clustering / classify() later
+        prediction_data=False,
     )
     clusterer.fit(reduced)
 

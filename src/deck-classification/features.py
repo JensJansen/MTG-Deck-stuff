@@ -18,6 +18,7 @@ Embeddings require a trained DeckTransformer checkpoint (MODEL_CHECKPOINT in
 config.py). If the checkpoint is absent the embedding step is skipped and
 Level 1 clustering falls back to the card presence matrix directly.
 """
+import array
 import os
 import re
 import sys
@@ -168,7 +169,8 @@ def compute_card_presence(
     id_to_row  = {did: i for i, did in enumerate(deck_ids)}
     card_index: dict[str, int] = {}
 
-    rows, cols = [], []
+    rows = array.array('i')
+    cols = array.array('i')
 
     print("  Computing card presence matrix...")
     for deck_id, card_name in tqdm(_stream_deck_cards(conn, fmt), desc="  Presence"):
@@ -224,7 +226,7 @@ def compute_embeddings(
 
     id_to_row = {did: i for i, did in enumerate(deck_ids)}
     N = len(deck_ids)
-    sums  = np.zeros((N, EMBEDDING_DIM), dtype=np.float64)
+    sums  = np.zeros((N, EMBEDDING_DIM), dtype=np.float32)
     counts = np.zeros(N, dtype=np.int32)
 
     print("  Computing deck embeddings...")
@@ -239,8 +241,7 @@ def compute_embeddings(
         counts[row] += 1
 
     counts[counts == 0] = 1
-    embeddings = (sums / counts[:, None]).astype(np.float32)
-    return embeddings
+    return sums / counts[:, None]
 
 
 # ── Cache helpers ──────────────────────────────────────────────────────────────
