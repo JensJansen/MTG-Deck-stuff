@@ -26,7 +26,7 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 "DATABASE_URL environment variable is not set.\n"
                 "Example: postgresql://user:pass@host:5432/dbname"
             )
-        _pool = psycopg2.pool.ThreadedConnectionPool(minconn=2, maxconn=10, dsn=url)
+        _pool = psycopg2.pool.ThreadedConnectionPool(minconn=2, maxconn=40, dsn=url)
     return _pool
 
 

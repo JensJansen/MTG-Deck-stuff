@@ -1,9 +1,9 @@
--- V17: Stored procedures for deck card submission
+-- V16: Stored procedures for deck card submission
 --
 -- submit_deck_cards   — for regular (non-singleton) formats; writes to deck_cards
 -- submit_singleton_deck — for singleton formats; writes JSONB to singleton_decks.cards
 --
--- Both return rows_written and collision flag via INOUT parameters.
+-- Neither procedure writes format into deck_cards (column does not exist).
 
 CREATE OR REPLACE PROCEDURE submit_deck_cards(
     p_deck_id      TEXT,
@@ -15,9 +15,8 @@ CREATE OR REPLACE PROCEDURE submit_deck_cards(
 LANGUAGE plpgsql AS $$
 DECLARE
     v_status TEXT;
-    v_format TEXT;
 BEGIN
-    SELECT status, format INTO v_status, v_format
+    SELECT status INTO v_status
     FROM   decks
     WHERE  public_id = p_deck_id;
 
@@ -28,12 +27,11 @@ BEGIN
 
     DELETE FROM deck_cards WHERE deck_id = p_deck_id;
 
-    INSERT INTO deck_cards (deck_id, card_id, board, quantity, format)
+    INSERT INTO deck_cards (deck_id, card_id, board, quantity)
     SELECT p_deck_id,
            c.id,
            elem->>'board',
-           (elem->>'quantity')::integer,
-           v_format
+           (elem->>'quantity')::integer
     FROM   jsonb_array_elements(p_cards) AS elem
     JOIN   cards c ON c.card_name = elem->>'card_name';
 

@@ -1,11 +1,17 @@
 app            = "deck-gen-scraper"
 primary_region = "iad"
 
+auto_stop_machines  = "off"
+auto_start_machines = false
+min_machines_running = 1
+
 [build]
+  dockerfile = "Dockerfile"
 
 [env]
-  SCRAPER_API_URL = "http://100.113.155.84:8000"
-  ALL_PROXY       = "socks5h://127.0.0.1:1055"
+  SCRAPER_API_URL    = "http://100.113.155.84:8000"
+  ALL_PROXY          = "socks5h://127.0.0.1:1055"
+  PYTHONUNBUFFERED   = "1"
 
 [[vm]]
   memory   = "256mb"

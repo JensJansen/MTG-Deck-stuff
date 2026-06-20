@@ -22,20 +22,66 @@ Usage:
 """
 
 import json
+import logging
 import os
+import time
+import traceback
 from typing import Annotated
 
+import psycopg2
 import psycopg2.extras
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import ALL_FORMATS, CLAIM_TIMEOUT_MINUTES, SINGLETON_FORMATS
 from constants.env import load_env
-from db import get_connection
+from db import get_connection, _get_pool
 
 load_env()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("api")
+
 app = FastAPI(title="Deck Scraper API", version="1.0")
+
+
+# ---------------------------------------------------------------------------
+# Request logging middleware
+# ---------------------------------------------------------------------------
+
+class _LogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        t0 = time.monotonic()
+        worker = request.headers.get("x-api-key", "")[:8] or "anon"
+        log.info("→ %s %s  (key=...%s)", request.method, request.url.path, worker[-4:])
+        _log_pool_state("pre-request")
+        try:
+            response: Response = await call_next(request)
+        except Exception:
+            elapsed = time.monotonic() - t0
+            log.error("← %s %s  UNHANDLED EXCEPTION  %.2fs\n%s",
+                      request.method, request.url.path, elapsed, traceback.format_exc())
+            raise
+        elapsed = time.monotonic() - t0
+        log.info("← %s %s  %s  %.2fs", request.method, request.url.path, response.status_code, elapsed)
+        return response
+
+app.add_middleware(_LogMiddleware)
+
+
+def _log_pool_state(label: str = "") -> None:
+    try:
+        pool = _get_pool()
+        used = len(pool._used)
+        avail = len(pool._pool)
+        log.info("pool[%s]: %d in-use, %d available, %d max", label, used, avail, pool.maxconn)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +159,6 @@ class CardsSubmission(BaseModel):
 
 class CardsResult(BaseModel):
     rows_written: int
-    collision: bool = False
 
 
 class DeckCardsSubmission(BaseModel):
@@ -126,12 +171,6 @@ class DeckCardsSubmission(BaseModel):
 class DeckCardsResult(BaseModel):
     deck_id: str
     rows_written: int
-    collision: bool
-
-
-class ErrorReport(BaseModel):
-    worker_id: str
-    detail: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +208,7 @@ def _upsert_decks(cur, rows: list[tuple], table: str) -> list[tuple]:
 
 def _claim_from(cur, table: str, timeout_minutes: int, batch_size: int, worker_id: str) -> list[tuple]:
     """Attempt to claim up to batch_size decks from the given table."""
+    t0 = time.monotonic()
     cur.execute(
         f"""
         WITH to_claim AS (
@@ -190,13 +230,46 @@ def _claim_from(cur, table: str, timeout_minutes: int, batch_size: int, worker_i
         """,
         (timeout_minutes, batch_size, worker_id),
     )
-    return cur.fetchall()
+    rows = cur.fetchall()
+    log.info("claim from %s: %d row(s) in %.2fs", table, len(rows), time.monotonic() - t0)
+    return rows
 
 
 def _call_submit_proc(cur, proc: str, deck_id: str, worker_id: str, cards_json: str) -> tuple[int, bool]:
-    cur.execute(f"CALL {proc}(%s, %s, %s::jsonb, 0, FALSE)", (deck_id, worker_id, cards_json))
-    row = cur.fetchone()
-    return (row[0], row[1]) if row else (0, False)
+    """
+    Call a submission stored procedure and return (rows_written, collision).
+    Uses a savepoint so a failure on this deck doesn't abort the outer transaction.
+    Returns (-1, False) if the call itself failed — caller should log and skip.
+    """
+    t0 = time.monotonic()
+    try:
+        cur.execute("SAVEPOINT deck_submit")
+        cur.execute(
+            f"CALL {proc}(%s, %s, %s::jsonb, 0, FALSE)",
+            (deck_id, worker_id, cards_json),
+        )
+        row = cur.fetchone()
+        cur.execute("RELEASE SAVEPOINT deck_submit")
+        rows_written = row[0] if row else 0
+        collision    = bool(row[1]) if row else False
+        elapsed = time.monotonic() - t0
+        log.info(
+            "  %s  proc=%s  rows=%d  collision=%s  %.2fs",
+            deck_id, proc, rows_written, collision, elapsed,
+        )
+        return rows_written, collision
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        log.error(
+            "  %s  proc=%s  FAILED in %.2fs: %s\n%s",
+            deck_id, proc, elapsed, exc, traceback.format_exc(),
+        )
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT deck_submit")
+            cur.execute("RELEASE SAVEPOINT deck_submit")
+        except Exception as rb_exc:
+            log.error("  savepoint rollback also failed: %s", rb_exc)
+        return -1, False
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +306,7 @@ def get_cards(_: Auth, format: str | None = None) -> list[CardInfo]:
             return [CardInfo(name=row[0], fully_swept=row[1]) for row in cur.fetchall()]
 
 
-@app.post("/cards/{card_name}/swept", status_code=200)
+@app.post("/cards/{card_name:path}/swept", status_code=200)
 def mark_card_swept(_: Auth, card_name: str, req: SweptRequest) -> dict:
     """Mark a card as fully swept for a given format."""
     if req.format not in ALL_FORMATS:
@@ -295,6 +368,7 @@ def claim_batch(_: Auth, req: BatchRequest) -> list[DeckOut]:
     Tries singleton_decks first; falls back to decks when no singleton work
     is available. Never mixes rows from both tables in one response.
     """
+    log.info("claim_batch: worker=%s size=%d", req.worker_id, req.batch_size)
     with get_connection() as conn:
         with conn.cursor() as cur:
             rows = _claim_from(cur, "singleton_decks", CLAIM_TIMEOUT_MINUTES, req.batch_size, req.worker_id)
@@ -302,6 +376,7 @@ def claim_batch(_: Auth, req: BatchRequest) -> list[DeckOut]:
                 rows = _claim_from(cur, "decks", CLAIM_TIMEOUT_MINUTES, req.batch_size, req.worker_id)
         conn.commit()
 
+    _log_pool_state("post-claim")
     return [DeckOut(public_id=r[0], name=r[1], format=r[2], author=r[3]) for r in rows]
 
 
@@ -311,13 +386,16 @@ def submit_cards_batch(_: Auth, submissions: list[DeckCardsSubmission]) -> list[
     Submit card rows for a batch of decks in a single request.
 
     Routes each deck to submit_singleton_deck or submit_deck_cards based on format.
-    All decks share one transaction.
+    Each deck uses a savepoint so one failure does not abort the whole batch.
     """
     if not submissions:
         return []
 
+    log.info("submit_cards_batch: %d deck(s)", len(submissions))
     results: list[DeckCardsResult] = []
+    failed  = 0
 
+    t0 = time.monotonic()
     with get_connection() as conn:
         with conn.cursor() as cur:
             for sub in submissions:
@@ -326,14 +404,25 @@ def submit_cards_batch(_: Auth, submissions: list[DeckCardsSubmission]) -> list[
                     {"card_name": c.card_name, "board": c.board, "quantity": c.quantity}
                     for c in sub.cards
                 ])
+                log.info("  submitting %s  proc=%s  cards=%d", sub.deck_id, proc, len(sub.cards))
                 rows_written, collision = _call_submit_proc(cur, proc, sub.deck_id, sub.worker_id, cards_json)
-                results.append(DeckCardsResult(
-                    deck_id=sub.deck_id,
-                    rows_written=rows_written,
-                    collision=collision,
-                ))
+
+                if rows_written == -1:
+                    failed += 1
+                elif collision:
+                    log.warning("  %s already done (collision) — skipping", sub.deck_id)
+                    results.append(DeckCardsResult(deck_id=sub.deck_id, rows_written=0))
+                else:
+                    results.append(DeckCardsResult(deck_id=sub.deck_id, rows_written=rows_written))
+
         conn.commit()
 
+    elapsed = time.monotonic() - t0
+    _log_pool_state("post-submit")
+    log.info(
+        "submit_cards_batch done: %d ok, %d failed, %d collision in %.2fs",
+        len(results), failed, sum(1 for r in results if r.rows_written == 0), elapsed,
+    )
     return results
 
 
@@ -357,19 +446,6 @@ def submit_cards(_: Auth, public_id: str, submission: CardsSubmission) -> CardsR
         conn.commit()
 
     if collision:
-        raise HTTPException(status_code=409, detail=f"Deck {public_id} is already done.")
+        raise HTTPException(status_code=409, detail="Deck already processed")
 
-    return CardsResult(rows_written=rows_written)
-
-
-@app.post("/decks/{public_id}/error", status_code=200)
-def report_error(_: Auth, public_id: str, report: ErrorReport) -> dict:
-    """Mark a deck as errored after a failed fetch attempt."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE decks SET status = 'error' WHERE public_id = %s",
-                (public_id,),
-            )
-        conn.commit()
-    return {"ok": True}
+    return CardsResult(rows_written=rows_written if rows_written != -1 else 0)

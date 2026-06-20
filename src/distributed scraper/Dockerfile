@@ -6,11 +6,13 @@ RUN apt-get update && apt-get install -y curl && \
 
 WORKDIR /app
 
-COPY requirements.scraper.txt .
+COPY ["src/distributed scraper/requirements.scraper.txt", "."]
 RUN pip install --no-cache-dir -r requirements.scraper.txt
 
-COPY scraper_node.py config.py ./
-COPY start.sh .
+COPY ["src/distributed scraper/scraper_node.py", "src/distributed scraper/config.py", "./"]
+COPY ["src/distributed scraper/start.sh", "."]
 RUN chmod +x start.sh
+
+COPY src/constants/ ./constants/
 
 CMD ["./start.sh"]

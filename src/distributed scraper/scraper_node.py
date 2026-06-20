@@ -25,6 +25,7 @@ import argparse
 import os
 import socket
 import time
+import traceback
 
 import requests
 
@@ -41,50 +42,48 @@ from config import (
 _API_HEADERS = {"X-Api-Key": SCRAPER_API_KEY}
 
 
+def _log(phase: str, msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] [{phase}] {msg}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Scraper API helpers
 # ---------------------------------------------------------------------------
 
 def api_claim_batch(batch_size: int, worker_id: str) -> list[dict]:
-    """Request a batch of unclaimed decks from the API. Returns list of deck objects."""
+    t0 = time.monotonic()
+    _log("CLAIM", f"requesting batch (size={batch_size}) from {SCRAPER_API_URL}/decks/batch")
     resp = requests.post(
         f"{SCRAPER_API_URL}/decks/batch",
         headers=_API_HEADERS,
         json={"batch_size": batch_size, "worker_id": worker_id},
-        timeout=15,
+        timeout=45,
     )
+    elapsed = time.monotonic() - t0
+    _log("CLAIM", f"response {resp.status_code} in {elapsed:.2f}s")
     resp.raise_for_status()
-    return resp.json()
+    decks = resp.json()
+    _log("CLAIM", f"claimed {len(decks)} deck(s)")
+    return decks
 
 
 def api_submit_batch(submissions: list[dict]) -> list[dict]:
-    """
-    Submit card rows for a batch of decks in one request.
-
-    Each entry in submissions must have: deck_id, worker_id, cards.
-    Returns a list of {deck_id, rows_written, collision} dicts.
-    """
+    t0 = time.monotonic()
+    _log("PERSIST", f"submitting {len(submissions)} deck(s) to {SCRAPER_API_URL}/decks/cards/batch")
     resp = requests.post(
         f"{SCRAPER_API_URL}/decks/cards/batch",
         headers=_API_HEADERS,
         json=submissions,
         timeout=60,
     )
+    elapsed = time.monotonic() - t0
+    _log("PERSIST", f"response {resp.status_code} in {elapsed:.2f}s")
+    if not resp.ok:
+        body_preview = resp.text[:300].replace("\n", " ")
+        _log("PERSIST", f"error body: {body_preview}")
     resp.raise_for_status()
     return resp.json()
-
-
-def api_report_error(public_id: str, worker_id: str, detail: str) -> None:
-    """Mark a deck as errored. Best-effort; logs but does not raise on failure."""
-    try:
-        requests.post(
-            f"{SCRAPER_API_URL}/decks/{public_id}/error",
-            headers=_API_HEADERS,
-            json={"worker_id": worker_id, "detail": detail},
-            timeout=10,
-        )
-    except requests.RequestException as exc:
-        print(f"  [warn] Could not report error for {public_id}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -118,99 +117,135 @@ def parse_deck_detail(detail: dict) -> list[dict]:
 # Processing loop
 # ---------------------------------------------------------------------------
 
-def process_batch(decks: list[dict], worker_id: str) -> tuple[int, int, int]:
+def process_batch(decks: list[dict], worker_id: str) -> tuple[int, int]:
     """
-    Process a claimed batch. Returns (done, collisions, errors).
+    Process a claimed batch. Returns (done, errors).
 
     Fetches all decks from Moxfield first (with rate limiting), then submits
-    all successful results to the API in a single batch request.
+    all successful results to the API in a single batch request. Failed decks
+    are skipped and will be automatically reclaimed after CLAIM_TIMEOUT_MINUTES.
     """
-    done       = 0
-    collisions = 0
-    errors     = 0
+    done   = 0
+    errors = 0
 
-    # Phase 1: fetch card details from Moxfield
+    # ---- Phase 2: fetch card details from Moxfield -------------------------
+    _log("MOXFIELD", f"fetching {len(decks)} deck(s) from Moxfield")
+    t_phase = time.monotonic()
     submissions: list[dict] = []
+
     for i, deck in enumerate(decks):
         public_id = deck["public_id"]
+        fmt       = deck.get("format", "unknown")
         if i > 0:
             time.sleep(RATE_LIMIT_SECONDS)
 
-        print(f"  [{i + 1}/{len(decks)}] {public_id}", end=" ... ", flush=True)
+        print(f"  [{i + 1}/{len(decks)}] {public_id} ({fmt})", end=" ... ", flush=True)
+        t0 = time.monotonic()
         try:
             detail         = fetch_deck_detail(public_id)
             deck_card_rows = parse_deck_detail(detail)
+            elapsed = time.monotonic() - t0
             submissions.append({
                 "deck_id":   public_id,
                 "worker_id": worker_id,
-                "format":    deck["format"],
+                "format":    fmt,
                 "cards":     deck_card_rows,
             })
-            print("fetched", flush=True)
+            print(f"ok ({len(deck_card_rows)} cards, {elapsed:.2f}s)", flush=True)
         except requests.HTTPError as exc:
-            code = exc.response.status_code
-            print(f"HTTP {code} — marking error")
-            api_report_error(public_id, worker_id, f"HTTP {code}")
+            elapsed = time.monotonic() - t0
+            body_preview = exc.response.text[:120].replace("\n", " ")
+            print(f"HTTP {exc.response.status_code} in {elapsed:.2f}s — skipping  [{body_preview}]", flush=True)
             errors += 1
         except requests.RequestException as exc:
-            print(f"request failed ({exc}) — marking error")
-            api_report_error(public_id, worker_id, str(exc))
+            elapsed = time.monotonic() - t0
+            print(f"request error in {elapsed:.2f}s — skipping  [{type(exc).__name__}: {exc}]", flush=True)
             errors += 1
 
-    if not submissions:
-        return done, collisions, errors
+    mox_elapsed = time.monotonic() - t_phase
+    _log("MOXFIELD", f"done: {len(submissions)} fetched, {errors} failed in {mox_elapsed:.1f}s")
 
-    # Phase 2: submit all fetched decks in one batch API call
-    print(f"  Submitting {len(submissions)} deck(s) as batch ...", flush=True)
-    results = api_submit_batch(submissions)
-    for result in results:
-        if result["collision"]:
-            print(f"  {result['deck_id']}: collision — deck already processed")
-            collisions += 1
-        else:
-            print(f"  {result['deck_id']}: done ({result['rows_written']} card-rows)")
+    if not submissions:
+        _log("PERSIST", "nothing to submit (all Moxfield fetches failed)")
+        return done, errors
+
+    # ---- Phase 3: submit to API --------------------------------------------
+    try:
+        t0 = time.monotonic()
+        results = api_submit_batch(submissions)
+        elapsed = time.monotonic() - t0
+
+        for result in results:
+            rows = result.get("rows_written", 0)
+            _log("PERSIST", f"  {result['deck_id']}: {rows} card-row(s) written")
             done += 1
 
-    return done, collisions, errors
+        _log("PERSIST", f"batch committed: {done} deck(s) in {elapsed:.1f}s")
+
+    except requests.HTTPError as exc:
+        _log("PERSIST", f"API error {exc.response.status_code} — batch NOT persisted, decks will be reclaimed")
+        _log("PERSIST", f"response body: {exc.response.text[:500]}")
+        errors += len(submissions)
+    except requests.Timeout:
+        _log("PERSIST", f"API timed out after 60s — batch NOT persisted, decks will be reclaimed")
+        errors += len(submissions)
+    except requests.RequestException as exc:
+        _log("PERSIST", f"API connection error — batch NOT persisted, decks will be reclaimed")
+        _log("PERSIST", f"{type(exc).__name__}: {exc}")
+        errors += len(submissions)
+    except Exception as exc:
+        _log("PERSIST", f"unexpected error during submission — batch NOT persisted")
+        _log("PERSIST", traceback.format_exc())
+        errors += len(submissions)
+
+    return done, errors
 
 
 def run_loop(batch_size: int, worker_id: str, once: bool, delay: float) -> None:
-    print(f"Scraper node '{worker_id}' starting  (batch_size={batch_size})")
+    _log("INIT", f"scraper node '{worker_id}' starting  (batch_size={batch_size}, api={SCRAPER_API_URL})")
+    _log("INIT", f"api_key set: {'yes' if SCRAPER_API_KEY else 'NO — requests will fail with 401'}")
 
-    total_done       = 0
-    total_collisions = 0
-    total_errors     = 0
+    total_done   = 0
+    total_errors = 0
 
     while True:
+        # ---- Phase 1: claim -------------------------------------------------
         try:
             decks = api_claim_batch(batch_size, worker_id)
+        except requests.HTTPError as exc:
+            _log("CLAIM", f"HTTP {exc.response.status_code} — sleeping {delay:.0f}s  [{exc.response.text[:200]}]")
+            time.sleep(delay)
+            continue
         except requests.RequestException as exc:
-            print(f"[error] Failed to claim batch: {exc}. Sleeping {delay:.0f}s ...")
+            _log("CLAIM", f"{type(exc).__name__}: {exc} — sleeping {delay:.0f}s")
             time.sleep(delay)
             continue
 
         if not decks:
             if once:
-                print("No claimable decks.")
+                _log("CLAIM", "no claimable decks")
                 break
-            print(f"No claimable decks — sleeping {delay:.0f}s ...")
+            _log("CLAIM", f"no claimable decks — sleeping {delay:.0f}s")
             time.sleep(delay)
             continue
 
-        print(f"\nClaimed {len(decks)} deck(s):")
-        done, collisions, errors = process_batch(decks, worker_id)
-        total_done       += done
-        total_collisions += collisions
-        total_errors     += errors
-        print(
-            f"  Batch done: {done} ok, {collisions} collision(s), {errors} error(s)  "
-            f"(total: {total_done} ok, {total_collisions} collision(s), {total_errors} error(s))"
-        )
+        _log("CLAIM", f"processing {len(decks)} deck(s)")
+        t_batch = time.monotonic()
+        done, errors = process_batch(decks, worker_id)
+        batch_elapsed = time.monotonic() - t_batch
+
+        total_done   += done
+        total_errors += errors
+        _log("BATCH", (
+            f"done={done} errors={errors} "
+            f"total=({total_done} ok, {total_errors} err) "
+            f"elapsed={batch_elapsed:.1f}s"
+        ))
 
         if once:
             break
 
-    print(f"\nFinished. {total_done} processed, {total_collisions} collision(s), {total_errors} error(s).")
+    _log("INIT", f"finished — {total_done} processed, {total_errors} skipped")
 
 
 # ---------------------------------------------------------------------------

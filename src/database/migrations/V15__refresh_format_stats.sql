@@ -1,9 +1,9 @@
--- V15: refresh_format_stats uses deck_cards.format directly
+-- V15: refresh_format_stats — batched pair accumulation, joins decks for format
 --
--- Card stats no longer JOINs to decks — it filters deck_cards by format
--- directly, using the index added in V13. The batch loop still fetches deck
--- IDs from decks (one row per deck, efficient pagination) but the per-batch
--- deck_cards query adds format to let the planner use the new index.
+-- deck_cards has no format column; format is derived by joining decks.
+-- Card stats JOIN decks once in the fmt_dc CTE.
+-- Pair accumulation paginates through decks for the format, then filters
+-- deck_cards by deck_id only (already constrained to the right format).
 
 CREATE OR REPLACE PROCEDURE refresh_format_stats(
     p_format      TEXT,
@@ -25,18 +25,19 @@ BEGIN
         PRIMARY KEY (card_id_a, card_id_b)
     );
 
-    -- ── 1. Card stats — direct format filter on deck_cards, no join to decks ──
+    -- ── 1. Card stats — join decks for format filter ─────────────────────────
     DELETE FROM card_stats WHERE format = p_format;
 
     INSERT INTO card_stats
         (card_name, format, deck_count, total_decks, inclusion_rate, avg_quantity)
     WITH
     fmt_dc AS (
-        SELECT   deck_id, card_id, SUM(quantity) AS quantity
-        FROM     deck_cards
-        WHERE    format = p_format
-          AND    board  = ANY(p_boards)
-        GROUP BY deck_id, card_id
+        SELECT   dc.deck_id, dc.card_id, SUM(dc.quantity) AS quantity
+        FROM     deck_cards dc
+        JOIN     decks d ON dc.deck_id = d.public_id
+        WHERE    d.format  = p_format
+          AND    dc.board  = ANY(p_boards)
+        GROUP BY dc.deck_id, dc.card_id
     ),
     total AS (
         SELECT COUNT(DISTINCT deck_id) AS n FROM fmt_dc
@@ -58,7 +59,7 @@ BEGIN
     JOIN   cards c ON pc.card_id = c.id
     CROSS  JOIN total t;
 
-    -- ── 2. Pair accumulation — batched, format on deck_cards used directly ────
+    -- ── 2. Pair accumulation — batched; deck_ids already scoped to format ────
     DELETE FROM card_pair_stats WHERE format = p_format;
 
     LOOP
@@ -77,8 +78,7 @@ BEGIN
         WITH batch_dc AS (
             SELECT DISTINCT deck_id, card_id
             FROM   deck_cards
-            WHERE  format  = p_format
-              AND  deck_id = ANY(v_batch_ids)
+            WHERE  deck_id = ANY(v_batch_ids)
               AND  board   = ANY(p_boards)
         )
         SELECT a.card_id,
