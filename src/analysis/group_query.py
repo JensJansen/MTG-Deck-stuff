@@ -5,7 +5,7 @@ Finds all decks in a format that contain every card in the group, then computes
 lift, PMI, Jaccard, and confidence for every other card appearing in those decks.
 Queries {format}_deck_cards directly; all metric computation runs in Postgres.
 Each deck is treated as an atomic unit — all cards are counted regardless of board.
-Only multi-card formats are supported (pauper, standard, modern, vintage, legacy).
+Only multi-card formats are supported (pauper, modern, vintage, legacy).
 
 Usage:
     python src/analysis/group_query.py --format pauper

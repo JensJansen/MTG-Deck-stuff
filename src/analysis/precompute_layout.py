@@ -4,7 +4,7 @@ precompute_layout.py - Compute UMAP 2D layout for card visualization.
 Reads co-occurrence pairs from {format}_card_pair_stats (via get_layout_pairs),
 builds a sparse Jaccard similarity matrix, runs UMAP to project cards to 2D,
 and writes coordinates to {format}_card_layout via store_card_layout.
-Only multi-card formats are supported (pauper, standard, modern, vintage, legacy).
+Only multi-card formats are supported (pauper, modern, vintage, legacy).
 Run compute_stats.py first to populate the stats tables.
 
 Usage:

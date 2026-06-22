@@ -3,7 +3,7 @@ query.py - Look up per-format co-occurrence stats for a specific card.
 
 Queries {format}_card_stats for inclusion rates and {format}_card_pair_stats
 for co-occurrence metrics. --format is required; only multi-card formats are
-supported (pauper, standard, modern, vintage, legacy).
+supported (pauper, modern, vintage, legacy).
 
 Usage:
     python src/analysis/query.py "Lightning Bolt" --format pauper

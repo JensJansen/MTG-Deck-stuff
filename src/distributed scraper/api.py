@@ -129,7 +129,6 @@ _CLAIM_ORDER: list[tuple[str, str]] = [
     ("commander",          "commander_decks"),
     ("highlanderCanadian", "canadian_highlander_decks"),
     ("pauper",             "pauper_decks"),
-    ("standard",           "standard_decks"),
     ("modern",             "modern_decks"),
     ("vintage",            "vintage_decks"),
     ("legacy",             "legacy_decks"),

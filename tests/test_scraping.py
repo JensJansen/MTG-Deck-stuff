@@ -57,7 +57,6 @@ class TestParseCard:
         "legalities": {
             "commander": "legal",
             "pauper":    "legal",
-            "standard":  "not_legal",
             "modern":    "legal",
             "vintage":   "legal",
             "legacy":    "legal",
@@ -85,12 +84,12 @@ class TestParseCard:
 
     def test_normal_format_legality_respected(self):
         row = parse_card(self.FULL_CARD)
-        assert row[COLUMNS.index("legal_standard")] == "not_legal"
+        assert row[COLUMNS.index("legal_pauper")] == "legal"
 
     def test_missing_legality_is_none(self):
         raw = {**self.FULL_CARD, "legalities": {}}
         row = parse_card(raw)
-        assert row[COLUMNS.index("legal_standard")] is None
+        assert row[COLUMNS.index("legal_modern")] is None
 
     def test_all_legal_formats_present_as_columns(self):
         for fmt in LEGAL_FORMATS:

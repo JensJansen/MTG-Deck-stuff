@@ -138,7 +138,7 @@ class TestConstants:
         assert SINGLETON_FORMATS == ["commander", "highlanderCanadian"]
 
     def test_regular_formats_exact(self):
-        assert REGULAR_FORMATS == ["pauper", "standard", "modern", "vintage", "legacy"]
+        assert REGULAR_FORMATS == ["pauper", "modern", "vintage", "legacy"]
 
     def test_all_formats_is_singleton_plus_regular(self):
         assert ALL_FORMATS == SINGLETON_FORMATS + REGULAR_FORMATS
@@ -149,7 +149,7 @@ class TestConstants:
     def test_legal_formats_exact(self):
         assert LEGAL_FORMATS == [
             "commander", "highlanderCanadian",
-            "pauper", "standard", "modern", "vintage", "legacy",
+            "pauper", "modern", "vintage", "legacy",
         ]
 
     def test_legal_formats_has_highlander(self):

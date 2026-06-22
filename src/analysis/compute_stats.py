@@ -6,7 +6,7 @@ procedure — no intermediate data is shipped to Python and back.
 Writes results to {format}_card_stats and {format}_card_pair_stats.
 Each deck is treated as an atomic unit: every card in {format}_deck_cards
 is counted regardless of board.
-Only regular (multi-card) formats are supported: pauper, standard, modern, vintage, legacy.
+Only regular (multi-card) formats are supported: pauper, modern, vintage, legacy.
 
 Usage:
     python src/analysis/compute_stats.py
@@ -20,6 +20,8 @@ Reads DATABASE_URL from src/distributed scraper/.env automatically.
 import argparse
 import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
@@ -110,6 +112,10 @@ def main() -> None:
 
     conn = psycopg2.connect(pg_url)
 
+    start = time.monotonic()
+    start_time = datetime.now()
+    print(f"Start: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
     try:
         print(f"Computing stats for: {', '.join(formats)}")
         print(f"Min co-occurrence: {args.min_cooccur}")
@@ -118,6 +124,10 @@ def main() -> None:
     finally:
         conn.close()
 
+    end_time = datetime.now()
+    elapsed = time.monotonic() - start
+    print(f"\nFinish:  {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Elapsed: {elapsed:.1f}s")
     print("\nDone.")
 
 
