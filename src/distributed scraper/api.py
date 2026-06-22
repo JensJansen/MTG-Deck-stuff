@@ -8,10 +8,9 @@ Endpoints:
     GET  /health                   Liveness probe (no auth required)
     GET  /cards                    Card names for discovery nodes to iterate
     POST /decks                    Bulk-upsert discovered decks (routes by format)
-    POST /decks/batch              Atomically claim a batch (singleton-first)
+    POST /decks/batch              Atomically claim a batch from a single format table
     POST /decks/cards/batch        Submit card rows for a batch of decks
     POST /decks/{id}/cards         Submit card rows for a single deck
-    POST /decks/{id}/error         Mark a deck as errored
 
 Environment variables:
     DATABASE_URL   PostgreSQL connection string (required)
@@ -104,6 +103,40 @@ Auth = Annotated[None, Depends(_require_key)]
 
 
 # ---------------------------------------------------------------------------
+# Format → table name helpers
+# ---------------------------------------------------------------------------
+
+# Formats whose canonical name differs from their table prefix.
+_FORMAT_TABLE_NAME: dict[str, str] = {
+    "highlanderCanadian": "canadian_highlander",
+}
+_TABLE_FORMAT_NAME: dict[str, str] = {v: k for k, v in _FORMAT_TABLE_NAME.items()}
+
+
+def _format_table(fmt: str) -> str:
+    """Return the table prefix for a format, e.g. 'highlanderCanadian' → 'canadian_highlander'."""
+    return _FORMAT_TABLE_NAME.get(fmt, fmt)
+
+
+def _table_format(prefix: str) -> str:
+    """Reverse of _format_table: table prefix → canonical format string."""
+    return _TABLE_FORMAT_NAME.get(prefix, prefix)
+
+
+# Ordered list of (canonical_format, deck_table) used by claim_batch.
+# A node always claims from exactly one table per request.
+_CLAIM_ORDER: list[tuple[str, str]] = [
+    ("commander",          "commander_decks"),
+    ("highlanderCanadian", "canadian_highlander_decks"),
+    ("pauper",             "pauper_decks"),
+    ("standard",           "standard_decks"),
+    ("modern",             "modern_decks"),
+    ("vintage",            "vintage_decks"),
+    ("legacy",             "legacy_decks"),
+]
+
+
+# ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
 
@@ -183,18 +216,18 @@ def _format_col(prefix: str, fmt: str) -> str:
         raise ValueError(f"Unknown format: {fmt!r}")
     return f"{prefix}_{fmt}"
 
+
 def _upsert_decks(cur, rows: list[tuple], table: str) -> list[tuple]:
-    """Bulk-upsert deck rows into the given table. Returns (is_new,) tuples."""
+    """Bulk-upsert deck rows into a per-format deck table. Returns (is_new,) tuples."""
     return psycopg2.extras.execute_values(
         cur,
         f"""
         INSERT INTO {table} (
-            public_id, name, format, author, color_mask,
+            public_id, name, author, color_mask,
             created_at_utc, updated_at_utc, scraped_at, status
         ) VALUES %s
         ON CONFLICT (public_id) DO UPDATE SET
             name           = EXCLUDED.name,
-            format         = EXCLUDED.format,
             author         = EXCLUDED.author,
             color_mask     = EXCLUDED.color_mask,
             updated_at_utc = EXCLUDED.updated_at_utc,
@@ -207,7 +240,7 @@ def _upsert_decks(cur, rows: list[tuple], table: str) -> list[tuple]:
 
 
 def _claim_from(cur, table: str, timeout_minutes: int, batch_size: int, worker_id: str) -> list[tuple]:
-    """Attempt to claim up to batch_size decks from the given table."""
+    """Attempt to claim up to batch_size decks from the given per-format deck table."""
     t0 = time.monotonic()
     cur.execute(
         f"""
@@ -226,7 +259,7 @@ def _claim_from(cur, table: str, timeout_minutes: int, batch_size: int, worker_i
                claimed_at = NOW(),
                claimed_by = %s
         WHERE  public_id IN (SELECT public_id FROM to_claim)
-        RETURNING public_id, name, format, author
+        RETURNING public_id, name, author
         """,
         (timeout_minutes, batch_size, worker_id),
     )
@@ -235,18 +268,22 @@ def _claim_from(cur, table: str, timeout_minutes: int, batch_size: int, worker_i
     return rows
 
 
-def _call_submit_proc(cur, proc: str, deck_id: str, worker_id: str, cards_json: str) -> tuple[int, bool]:
+def _call_submit_proc(cur, proc: str, args: tuple) -> tuple[int, bool]:
     """
     Call a submission stored procedure and return (rows_written, collision).
-    Uses a savepoint so a failure on this deck doesn't abort the outer transaction.
-    Returns (-1, False) if the call itself failed — caller should log and skip.
+    All positional args are passed via `args`; cards JSON must be the final element
+    and is cast to JSONB automatically. Uses a savepoint so a failure on this deck
+    does not abort the outer transaction.
+    Returns (-1, False) if the call itself failed.
     """
     t0 = time.monotonic()
     try:
         cur.execute("SAVEPOINT deck_submit")
+        n_pre = len(args) - 1
+        placeholders = ", ".join(["%s"] * n_pre)
         cur.execute(
-            f"CALL {proc}(%s, %s, %s::jsonb, 0, FALSE)",
-            (deck_id, worker_id, cards_json),
+            f"CALL {proc}({placeholders}, %s::jsonb, 0, FALSE)",
+            args,
         )
         row = cur.fetchone()
         cur.execute("RELEASE SAVEPOINT deck_submit")
@@ -255,14 +292,14 @@ def _call_submit_proc(cur, proc: str, deck_id: str, worker_id: str, cards_json: 
         elapsed = time.monotonic() - t0
         log.info(
             "  %s  proc=%s  rows=%d  collision=%s  %.2fs",
-            deck_id, proc, rows_written, collision, elapsed,
+            args[2] if len(args) > 2 else args[1], proc, rows_written, collision, elapsed,
         )
         return rows_written, collision
     except Exception as exc:
         elapsed = time.monotonic() - t0
         log.error(
-            "  %s  proc=%s  FAILED in %.2fs: %s\n%s",
-            deck_id, proc, elapsed, exc, traceback.format_exc(),
+            "  proc=%s  FAILED in %.2fs: %s\n%s",
+            proc, elapsed, exc, traceback.format_exc(),
         )
         try:
             cur.execute("ROLLBACK TO SAVEPOINT deck_submit")
@@ -270,6 +307,20 @@ def _call_submit_proc(cur, proc: str, deck_id: str, worker_id: str, cards_json: 
         except Exception as rb_exc:
             log.error("  savepoint rollback also failed: %s", rb_exc)
         return -1, False
+
+
+def _submission_proc_and_args(fmt: str, deck_id: str, worker_id: str, cards_json: str) -> tuple[str, tuple]:
+    """Return (proc_name, full_args_tuple) for submitting cards for a deck of the given format."""
+    table_prefix = _format_table(fmt)
+    if fmt in SINGLETON_FORMATS:
+        return (
+            "submit_format_singleton_deck",
+            (f"{table_prefix}_decks", deck_id, worker_id, cards_json),
+        )
+    return (
+        "submit_format_deck_cards",
+        (f"{table_prefix}_decks", f"{table_prefix}_deck_cards", deck_id, worker_id, cards_json),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,31 +376,37 @@ def mark_card_swept(_: Auth, card_name: str, req: SweptRequest) -> dict:
 @app.post("/decks", response_model=UpsertResult)
 def post_decks(_: Auth, decks: list[DeckIn]) -> UpsertResult:
     """
-    Bulk-upsert newly discovered decks, routing to singleton_decks or decks by format.
+    Bulk-upsert newly discovered decks into per-format deck tables.
 
+    Decks are grouped by format and each group is upserted into its own table.
     On conflict, metadata fields are refreshed but status/claimed_at/claimed_by
     are never overwritten, so claimed or done decks remain untouched.
     """
     if not decks:
         return UpsertResult(upserted=0, new=0, existing=0)
 
+    invalid = {d.format for d in decks if d.format not in ALL_FORMATS}
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown format(s): {invalid}")
+
+    by_format: dict[str, list[DeckIn]] = {}
+    for d in decks:
+        by_format.setdefault(d.format, []).append(d)
+
     def _rows(subset: list[DeckIn]) -> list[tuple]:
         return [
-            (d.public_id, d.name, d.format, d.author, d.color_mask,
+            (d.public_id, d.name, d.author, d.color_mask,
              d.created_at_utc, d.updated_at_utc, d.scraped_at, "discovered")
             for d in subset
         ]
 
-    singleton = [d for d in decks if d.format in SINGLETON_FORMATS]
-    regular   = [d for d in decks if d.format not in SINGLETON_FORMATS]
     returned: list[tuple] = []
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            if singleton:
-                returned += _upsert_decks(cur, _rows(singleton), "singleton_decks")
-            if regular:
-                returned += _upsert_decks(cur, _rows(regular), "decks")
+            for fmt, group in by_format.items():
+                table = f"{_format_table(fmt)}_decks"
+                returned += _upsert_decks(cur, _rows(group), table)
         conn.commit()
 
     new_count = sum(1 for (is_new,) in returned if is_new)
@@ -363,21 +420,25 @@ def post_decks(_: Auth, decks: list[DeckIn]) -> UpsertResult:
 @app.post("/decks/batch", response_model=list[DeckOut])
 def claim_batch(_: Auth, req: BatchRequest) -> list[DeckOut]:
     """
-    Atomically claim up to batch_size unclaimed decks.
+    Atomically claim up to batch_size unclaimed decks from a single format table.
 
-    Tries singleton_decks first; falls back to decks when no singleton work
-    is available. Never mixes rows from both tables in one response.
+    Iterates per-format tables in priority order and returns from the first table
+    that has claimable work. A batch is always from one format — nodes never
+    receive a mix of formats in a single response.
     """
     log.info("claim_batch: worker=%s size=%d", req.worker_id, req.batch_size)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            rows = _claim_from(cur, "singleton_decks", CLAIM_TIMEOUT_MINUTES, req.batch_size, req.worker_id)
-            if not rows:
-                rows = _claim_from(cur, "decks", CLAIM_TIMEOUT_MINUTES, req.batch_size, req.worker_id)
+            for fmt, table in _CLAIM_ORDER:
+                rows = _claim_from(cur, table, CLAIM_TIMEOUT_MINUTES, req.batch_size, req.worker_id)
+                if rows:
+                    conn.commit()
+                    _log_pool_state("post-claim")
+                    return [DeckOut(public_id=r[0], name=r[1], format=fmt, author=r[2]) for r in rows]
         conn.commit()
 
     _log_pool_state("post-claim")
-    return [DeckOut(public_id=r[0], name=r[1], format=r[2], author=r[3]) for r in rows]
+    return []
 
 
 @app.post("/decks/cards/batch", response_model=list[DeckCardsResult])
@@ -385,7 +446,7 @@ def submit_cards_batch(_: Auth, submissions: list[DeckCardsSubmission]) -> list[
     """
     Submit card rows for a batch of decks in a single request.
 
-    Routes each deck to submit_singleton_deck or submit_deck_cards based on format.
+    Routes each deck to the correct per-format stored procedure based on format.
     Each deck uses a savepoint so one failure does not abort the whole batch.
     """
     if not submissions:
@@ -399,13 +460,13 @@ def submit_cards_batch(_: Auth, submissions: list[DeckCardsSubmission]) -> list[
     with get_connection() as conn:
         with conn.cursor() as cur:
             for sub in submissions:
-                proc = "submit_singleton_deck" if sub.format in SINGLETON_FORMATS else "submit_deck_cards"
                 cards_json = json.dumps([
                     {"card_name": c.card_name, "board": c.board, "quantity": c.quantity}
                     for c in sub.cards
                 ])
+                proc, args = _submission_proc_and_args(sub.format, sub.deck_id, sub.worker_id, cards_json)
                 log.info("  submitting %s  proc=%s  cards=%d", sub.deck_id, proc, len(sub.cards))
-                rows_written, collision = _call_submit_proc(cur, proc, sub.deck_id, sub.worker_id, cards_json)
+                rows_written, collision = _call_submit_proc(cur, proc, args)
 
                 if rows_written == -1:
                     failed += 1
@@ -431,18 +492,18 @@ def submit_cards(_: Auth, public_id: str, submission: CardsSubmission) -> CardsR
     """
     Write card rows for a single processed deck and mark it done.
 
-    Routes to submit_singleton_deck or submit_deck_cards based on format.
+    Routes to the correct per-format stored procedure based on format.
     Returns 409 if the deck was already done.
     """
-    proc = "submit_singleton_deck" if submission.format in SINGLETON_FORMATS else "submit_deck_cards"
     cards_json = json.dumps([
         {"card_name": c.card_name, "board": c.board, "quantity": c.quantity}
         for c in submission.cards
     ])
+    proc, args = _submission_proc_and_args(submission.format, public_id, submission.worker_id, cards_json)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            rows_written, collision = _call_submit_proc(cur, proc, public_id, submission.worker_id, cards_json)
+            rows_written, collision = _call_submit_proc(cur, proc, args)
         conn.commit()
 
     if collision:

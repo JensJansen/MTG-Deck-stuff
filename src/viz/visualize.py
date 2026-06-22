@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import psycopg2
 
-from constants.moxfield import encode_colors
+from constants.moxfield import encode_colors, REGULAR_FORMATS
 from constants.env import load_env
 
 OUTPUT_DIR = Path(__file__).parent / "public" / "data"
@@ -56,25 +56,27 @@ def categorize_color(color_identity: str) -> str:
 # ---------------------------------------------------------------------------
 
 def get_layout_formats(conn, fmt_filter: str | None) -> list[str]:
-    if fmt_filter:
-        return [fmt_filter]
-    with conn.cursor() as cur:
-        cur.execute("SELECT DISTINCT format FROM card_layout ORDER BY format")
-        return [r[0] for r in cur.fetchall()]
+    fmts = [fmt_filter] if fmt_filter else list(REGULAR_FORMATS)
+    result = []
+    for fmt in fmts:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT EXISTS(SELECT 1 FROM {fmt}_card_layout LIMIT 1)")
+            if cur.fetchone()[0]:
+                result.append(fmt)
+    return result
 
 
 def load_nodes(conn, fmt: str) -> list[dict]:
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT
                 cl.card_name, cl.x, cl.y, cl.color_identity,
                 cs.deck_count, cs.total_decks, cs.inclusion_rate, cs.avg_quantity,
                 c.image_uri
-            FROM card_layout cl
-            JOIN card_stats cs ON cl.card_name = cs.card_name AND cl.format = cs.format
+            FROM {fmt}_card_layout cl
+            JOIN {fmt}_card_stats cs ON cl.card_name = cs.card_name
             LEFT JOIN cards c ON cl.card_name = c.card_name
-            WHERE cl.format = %s
-        """, (fmt,))
+        """)
         rows = cur.fetchall()
 
     return [
@@ -99,20 +101,19 @@ def _load_pair_rows(
 ) -> list[tuple]:
     card_list = list(card_names)
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT card_a, card_b, cooccurrence_count, lift, jaccard
-            FROM card_pair_stats
-            WHERE format = %s AND cooccurrence_count >= %s
+            FROM {fmt}_card_pair_stats
+            WHERE cooccurrence_count >= %s
               AND card_a = ANY(%s) AND card_b = ANY(%s)
             ORDER BY cooccurrence_count DESC
-        """, (fmt, min_cooccur, card_list, card_list))
+        """, (min_cooccur, card_list, card_list))
         return cur.fetchall()
 
 
-def load_ego(conn, fmt: str, card_names: set[str]) -> dict[str, list[dict]]:
-    rows = _load_pair_rows(conn, fmt, card_names, EGO_MIN_COOCCUR)
+def load_ego(pair_rows: list[tuple]) -> dict[str, list[dict]]:
     ego: dict[str, list] = defaultdict(list)
-    for card_a, card_b, cooccur, lift, jaccard in rows:
+    for card_a, card_b, cooccur, lift, jaccard in pair_rows:
         if len(ego[card_a]) < EGO_TOP_N:
             ego[card_a].append({"n": card_b, "c": cooccur, "l": round(lift, 2), "j": round(jaccard, 3)})
         if len(ego[card_b]) < EGO_TOP_N:
@@ -122,11 +123,11 @@ def load_ego(conn, fmt: str, card_names: set[str]) -> dict[str, list[dict]]:
 
 def load_edges(conn, fmt: str, name_to_idx: dict[str, int]) -> list[list[int]]:
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT card_a, card_b, jaccard
-            FROM card_pair_stats
-            WHERE format = %s AND cooccurrence_count >= %s
-        """, (fmt, GRAPH_MIN_COOCCUR))
+            FROM {fmt}_card_pair_stats
+            WHERE cooccurrence_count >= %s
+        """, (GRAPH_MIN_COOCCUR,))
         rows = cur.fetchall()
 
     edges = []
@@ -138,11 +139,10 @@ def load_edges(conn, fmt: str, name_to_idx: dict[str, int]) -> list[list[int]]:
     return edges
 
 
-def load_focus(conn, fmt: str, card_names: set[str]) -> dict[str, list]:
-    """All co-occurring pairs (>=FOCUS_MIN_COOCCUR) as compact [name, count, lift] tuples."""
-    rows = _load_pair_rows(conn, fmt, card_names, FOCUS_MIN_COOCCUR)
+def load_focus(pair_rows: list[tuple]) -> dict[str, list]:
+    """All co-occurring pairs as compact [name, count, lift] tuples."""
     focus: dict[str, list] = defaultdict(list)
-    for card_a, card_b, cooccur, lift, _jaccard in rows:
+    for card_a, card_b, cooccur, lift, _jaccard in pair_rows:
         focus[card_a].append([card_b, cooccur, round(lift, 2)])
         focus[card_b].append([card_a, cooccur, round(lift, 2)])
     return dict(focus)
@@ -161,7 +161,8 @@ def export_format(conn, fmt: str, output_dir: Path) -> bool:
     card_names  = {n["name"] for n in nodes}
     name_to_idx = {n["name"]: i for i, n in enumerate(nodes)}
 
-    ego   = load_ego(conn, fmt, card_names)
+    pair_rows = _load_pair_rows(conn, fmt, card_names, EGO_MIN_COOCCUR)
+    ego   = load_ego(pair_rows)
     edges = load_edges(conn, fmt, name_to_idx)
 
     payload = {
@@ -176,7 +177,7 @@ def export_format(conn, fmt: str, output_dir: Path) -> bool:
     size_kb = out_path.stat().st_size // 1024
     print(f"  {out_path.name}  ({len(nodes):,} cards, {len(edges):,} edges, {size_kb} KB)")
 
-    focus      = load_focus(conn, fmt, card_names)
+    focus      = load_focus(pair_rows)
     focus_path = output_dir / f"{fmt}.focus.json"
     focus_path.write_text(json.dumps(focus, separators=(",", ":")), encoding="utf-8")
     focus_kb = focus_path.stat().st_size // 1024
@@ -204,12 +205,17 @@ def main() -> None:
                         help="Limit to one format (default: all with layout data)")
     args = parser.parse_args()
 
+    if args.format and args.format not in REGULAR_FORMATS:
+        print(f"ERROR: '{args.format}' is not a supported format.")
+        print(f"  Supported: {', '.join(REGULAR_FORMATS)}")
+        sys.exit(1)
+
     load_env()
 
     pg_url = os.environ.get("DATABASE_URL")
     if not pg_url:
         print("ERROR: DATABASE_URL not set. Fill in src/distributed scraper/.env and retry.")
-        return
+        sys.exit(1)
 
     conn = psycopg2.connect(pg_url)
 
@@ -231,16 +237,8 @@ def main() -> None:
         conn.close()
 
     if exported:
-        manifest_path = OUTPUT_DIR / "manifest.json"
-        existing: list[str] = []
-        if manifest_path.exists():
-            try:
-                existing = json.loads(manifest_path.read_text())["formats"]
-            except (json.JSONDecodeError, KeyError) as exc:
-                print(f"  [warn] manifest.json is malformed ({exc}), starting fresh")
-        all_formats = sorted(set(existing) | set(exported))
-        write_manifest(OUTPUT_DIR, all_formats)
-        print(f"\nManifest updated: {all_formats}")
+        write_manifest(OUTPUT_DIR, sorted(exported))
+        print(f"\nManifest updated: {sorted(exported)}")
 
     print("\nDone.")
 
