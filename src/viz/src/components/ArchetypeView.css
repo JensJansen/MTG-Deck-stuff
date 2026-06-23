@@ -1,0 +1,79 @@
+/* ── Container ──────────────────────────────────────────── */
+.archetype-view {
+  position: relative;
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: var(--bg-base);
+}
+
+/* ── L1 container frame ─────────────────────────────────── */
+.at-container {
+  position: absolute;
+  z-index: 1;
+  border: 1px solid;
+  border-radius: 3px;
+  box-sizing: border-box;
+  overflow: hidden;
+  /* pointer-events set inline to 'none'; header overrides to 'auto' */
+}
+
+.at-container__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  gap: 6px;
+}
+.at-container__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.at-container__share {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 400;
+  opacity: 0.65;
+}
+
+/* ── Leaf tiles ─────────────────────────────────────────── */
+.at-tile {
+  position: absolute;
+  z-index: 2;   /* always above at-container */
+  border: 1px solid;
+  border-radius: 2px;
+  box-sizing: border-box;
+  cursor: pointer;
+  overflow: hidden;
+  transition: filter 0.12s;
+}
+.at-tile:hover { filter: brightness(1.4); }
+.at-tile--selected { z-index: 5; }
+.at-tile--l1 { border-width: 2px; }
+.at-tile--noise {
+  background: rgba(255,255,255,0.025);
+  border-color: rgba(255,255,255,0.05);
+  cursor: default;
+}
+.at-tile--noise:hover { filter: none; }
+
+.at-tile__label {
+  padding: 5px 7px 1px;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.3;
+}
+.at-tile__share {
+  padding: 0 7px;
+  font-size: 10px;
+}

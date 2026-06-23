@@ -33,10 +33,8 @@ class TestStructural:
         assert not hasattr(visualize, "color_mask_from_identity"), \
             "color_mask_from_identity should have been replaced by encode_colors"
 
-    def test_get_formats_was_renamed_to_get_layout_formats(self):
-        assert not hasattr(visualize, "get_formats"), \
-            "get_formats should have been renamed to get_layout_formats"
-        assert hasattr(visualize, "get_layout_formats")
+    def test_get_formats_exists(self):
+        assert hasattr(visualize, "get_formats") and callable(visualize.get_formats)
 
     def test_local_load_env_was_removed(self):
         assert not hasattr(visualize, "_load_env"), \

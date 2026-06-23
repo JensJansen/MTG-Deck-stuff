@@ -1,4 +1,4 @@
-.ego-network { flex: 1; position: relative; overflow: hidden; }
+.ego-network { height: 340px; flex-shrink: 0; position: relative; overflow: hidden; }
 .ego-network svg { width: 100%; height: 100%; }
 
 .ego-network__tooltip {

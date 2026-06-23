@@ -75,23 +75,31 @@ def write_archetypes(
                 parent_db,
                 _centroid_to_bytes(r.get("centroid")),
                 psycopg2.extras.Json(r["keystone_cards"]) if r.get("keystone_cards") else None,
+                psycopg2.extras.Json(r["top_cards"])      if r.get("top_cards")      else None,
+                psycopg2.extras.Json(r["color_profile"])  if r.get("color_profile")  else None,
+                psycopg2.extras.Json(r["cmc_curve"])      if r.get("cmc_curve")      else None,
                 r["member_count"],
                 run_id,
             ))
 
         with conn.cursor() as cur:
-            psycopg2.extras.execute_values(
-                cur,
-                """
-                INSERT INTO archetypes
-                    (format, level, parent_id, centroid, keystone_cards, member_count, run_id)
-                VALUES %s
-                RETURNING id
-                """,
-                rows,
-                fetch=True,
-            )
-            db_ids = [row[0] for row in cur.fetchall()]
+            # execute_values(fetch=True) returns accumulated RETURNING results
+            # across all pages internally — do NOT call cur.fetchall() after it.
+            db_ids = [
+                row[0]
+                for row in psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO archetypes
+                        (format, level, parent_id, centroid, keystone_cards,
+                         top_cards, color_profile, cmc_curve, member_count, run_id)
+                    VALUES %s
+                    RETURNING id
+                    """,
+                    rows,
+                    fetch=True,
+                )
+            ]
 
         for r, db_id in zip(level_records, db_ids):
             local_to_db[(level, r["local_id"])] = db_id

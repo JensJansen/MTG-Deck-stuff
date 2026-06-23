@@ -30,7 +30,7 @@ from config import (
 
 def _reduce(embeddings: np.ndarray) -> np.ndarray:
     """UMAP: (N, D) → (N, UMAP_N_COMPONENTS)."""
-    print(f"  UMAP: {embeddings.shape} → ({len(embeddings)}, {UMAP_N_COMPONENTS})...")
+    print(f"  UMAP: {embeddings.shape} → ({embeddings.shape[0]}, {UMAP_N_COMPONENTS})...")
     reducer = umap.UMAP(
         n_components=UMAP_N_COMPONENTS,
         n_neighbors=UMAP_N_NEIGHBORS,

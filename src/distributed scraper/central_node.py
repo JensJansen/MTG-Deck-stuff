@@ -1,21 +1,22 @@
 """
 central_node.py - Discover Moxfield decks and record them via the scraper API.
 
-This node paginates through Moxfield search results for each card in the
-shared card catalogue, posting discovered decks to the API server. It never
-writes to the database directly.
+This node leases cards from the API (POST /cards/claim), then paginates through
+Moxfield search results for each leased card, posting discovered decks back to
+the API. It never writes to the database directly and never chooses which cards
+to work on — the API hands out distinct cards so any number of nodes can run in
+parallel without overlapping.
 
-Sweep mode is determined automatically per card from card_sweep_status:
-cards that have never been fully swept run in full-sweep mode (all pages);
-cards previously swept run in incremental mode (stops when previously-seen
-decks are detected).
+Sweep mode is decided by the API per card: cards never fully swept run in
+full-sweep mode (all pages); previously-swept cards run in incremental mode
+(stops once previously-seen decks appear).
+
+Exactly one format is processed per invocation (--format is required).
 
 Usage:
-    python "src/distributed scraper/central_node.py"
     python "src/distributed scraper/central_node.py" --format pauper
-    python "src/distributed scraper/central_node.py" --format pauper --format modern --format legacy
-    python "src/distributed scraper/central_node.py" --format commander --start-card "Lightning Bolt"
-    python "src/distributed scraper/central_node.py" --format commander --reversed --start-card "Wizard's Retort"
+    python "src/distributed scraper/central_node.py" --format commander
+    python "src/distributed scraper/central_node.py" --format commander --batch-size 10
 
 Environment:
     SCRAPER_API_URL   Base URL of the scraper API (default: http://localhost:8000)
@@ -23,6 +24,8 @@ Environment:
 """
 
 import argparse
+import os
+import socket
 import time
 from urllib.parse import quote
 
@@ -46,13 +49,13 @@ _API_HEADERS = {"X-Api-Key": SCRAPER_API_KEY}
 # Scraper API helpers
 # ---------------------------------------------------------------------------
 
-def _api_get_cards(fmt: str) -> list[tuple[str, bool]]:
-    """Returns [(card_name, fully_swept), ...] for cards legal in fmt."""
-    resp = requests.get(
-        f"{SCRAPER_API_URL}/cards",
+def _api_claim_cards(fmt: str, worker_id: str, batch_size: int) -> list[tuple[str, bool]]:
+    """Lease a batch of cards from the API. Returns [(card_name, fully_swept), ...]."""
+    resp = requests.post(
+        f"{SCRAPER_API_URL}/cards/claim",
         headers=_API_HEADERS,
-        params={"format": fmt},
-        timeout=15,
+        json={"format": fmt, "worker_id": worker_id, "batch_size": batch_size},
+        timeout=30,
     )
     resp.raise_for_status()
     return [(c["name"], c["fully_swept"]) for c in resp.json()]
@@ -160,29 +163,51 @@ def _sweep_one_card(
     return new_decks, page, reached_end
 
 
-def sweep(card_infos: list[tuple[str, bool]], fmt: str, page_size: int) -> None:
-    n = len(card_infos)
-    print(f"Central node: sweeping {n} card(s) [{fmt}]")
+def run(fmt: str, page_size: int, worker_id: str, batch_size: int, delay: float) -> None:
+    """
+    Claim cards from the API and sweep them until no claimable cards remain.
 
-    total = 0
-    w = len(str(n))
+    A transient API failure does not kill the node: the claim is retried after
+    `delay` seconds (matching the scraper node), so a brief API outage self-heals
+    instead of sidelining the node until the wrapper's next restart.
+    """
+    print(f"Central node [{fmt}]  worker={worker_id}  batch={batch_size}")
 
-    for idx, (card_name, fully_swept) in enumerate(card_infos, 1):
-        full_sweep = not fully_swept
-        mode = "incremental" if fully_swept else "full"
-        print(f"\n  [{idx:>{w}}/{n}] {card_name}  [{mode}]", flush=True)
-        new_decks, pages, reached_end = _sweep_one_card(card_name, fmt, page_size, full_sweep)
-        total += new_decks
-        if new_decks:
-            print(f"    -> +{new_decks} deck(s) across {pages} page(s)")
-        if reached_end and not fully_swept:
-            try:
-                _api_mark_swept(card_name, fmt)
-            except requests.RequestException as exc:
-                print(f"    [warn] Could not mark {card_name!r} as swept: {exc}")
-        time.sleep(RATE_LIMIT_SECONDS)
+    total_decks = 0
+    cards_done = 0
 
-    print(f"\nDone. {total} deck(s) discovered.")
+    while True:
+        try:
+            cards = _api_claim_cards(fmt, worker_id, batch_size)
+        except requests.RequestException as exc:
+            print(f"  [warn] claim request to {SCRAPER_API_URL} failed: {exc} "
+                  f"- retrying in {delay:.0f}s")
+            time.sleep(delay)
+            continue
+
+        if not cards:
+            print(f"\nNo claimable cards for {fmt}. "
+                  f"Processed {cards_done} card(s), discovered {total_decks} deck(s).")
+            return
+
+        for card_name, fully_swept in cards:
+            full_sweep = not fully_swept
+            mode = "incremental" if fully_swept else "full"
+            print(f"\n  {card_name}  [{mode}]", flush=True)
+            new_decks, pages, reached_end = _sweep_one_card(card_name, fmt, page_size, full_sweep)
+            total_decks += new_decks
+            cards_done += 1
+            if new_decks:
+                print(f"    -> +{new_decks} deck(s) across {pages} page(s)")
+            # Flip swept FALSE->TRUE only when a first full sweep completes.
+            # Incremental refreshes are already swept; their claim timestamp
+            # (stamped at claim time) advances the refresh queue on its own.
+            if reached_end and not fully_swept:
+                try:
+                    _api_mark_swept(card_name, fmt)
+                except requests.RequestException as exc:
+                    print(f"    [warn] Could not mark {card_name!r} swept: {exc}")
+            time.sleep(RATE_LIMIT_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -191,66 +216,35 @@ def sweep(card_infos: list[tuple[str, bool]], fmt: str, page_size: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Central node: discover Moxfield decks via the scraper API.",
+        description="Central node: discover Moxfield decks via API-leased cards.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python "src/distributed scraper/central_node.py"
   python "src/distributed scraper/central_node.py" --format pauper
-  python "src/distributed scraper/central_node.py" --format pauper --format modern --format legacy
-  python "src/distributed scraper/central_node.py" --format commander --reversed --start-card "Wizard's Retort"
+  python "src/distributed scraper/central_node.py" --format commander --batch-size 10
 """,
     )
 
-    parser.add_argument("--format", "-f", dest="formats", action="append",
-                        default=[], choices=ALL_FORMATS, metavar="FORMAT",
-                        help="Format to sweep (repeatable). Defaults to all formats.")
-    parser.add_argument("--page-size",  dest="page_size",  type=int, default=100,
+    parser.add_argument("--format", "-f", dest="format", required=True,
+                        choices=ALL_FORMATS, metavar="FORMAT",
+                        help="Format to process (exactly one; required).")
+    parser.add_argument("--page-size", dest="page_size", type=int, default=100,
                         choices=[10, 25, 50, 64, 100])
-    parser.add_argument("--reversed", dest="reversed", action="store_true",
-                        help="Process cards in reverse order within each format")
-    parser.add_argument("--start-card", dest="start_card", default=None, metavar="CARD",
-                        help="Skip all cards before this one in the (possibly reversed) list")
+    parser.add_argument("--batch-size", dest="batch_size", type=int, default=5,
+                        help="Cards to lease from the API per claim request (default 5).")
+    parser.add_argument("--worker-id", dest="worker_id", default=None, metavar="ID",
+                        help="Identifier stored with leased cards (default hostname:pid).")
+    parser.add_argument("--delay", dest="delay", type=float, default=30.0,
+                        help="Seconds to wait before retrying after an API failure (default 30).")
 
     args = parser.parse_args()
+    worker_id = args.worker_id or f"{socket.gethostname()}:{os.getpid()}"
 
-    def _apply_start(
-        infos: list[tuple[str, bool]], start: str | None, context: str
-    ) -> list[tuple[str, bool]] | None:
-        if not start:
-            return infos
-        names = [name for name, _ in infos]
-        try:
-            idx = names.index(start)
-        except ValueError:
-            print(f"ERROR: --start-card {start!r} not found in card list for {context}")
-            return None
-        if idx:
-            print(f"  Skipping {idx} card(s) before {start!r}")
-        return infos[idx:]
-
-    formats = args.formats if args.formats else list(ALL_FORMATS)
-
-    # Sweep each format independently so per-format Moxfield result pages aren't
-    # shared across formats (each gets its own 10,000-deck cap).
-    for fmt in formats:
-        print(f"\n{'='*60}")
-        print(f"Format: {fmt}")
-        print(f"{'='*60}")
-        try:
-            card_infos = _api_get_cards(fmt)
-        except requests.RequestException as exc:
-            print(f"ERROR: Could not reach API at {SCRAPER_API_URL}: {exc}")
-            return
-        if not card_infos:
-            print(f"No cards found for {fmt}, skipping.")
-            continue
-        if args.reversed:
-            card_infos = list(reversed(card_infos))
-        card_infos = _apply_start(card_infos, args.start_card, fmt)
-        if card_infos is None:
-            return
-        sweep(card_infos, fmt, args.page_size)
+    fmt = args.format
+    print(f"\n{'='*60}")
+    print(f"Format: {fmt}")
+    print(f"{'='*60}")
+    run(fmt, args.page_size, worker_id, args.batch_size, args.delay)
 
 
 if __name__ == "__main__":

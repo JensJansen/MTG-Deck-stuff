@@ -11,6 +11,7 @@ interface Props {
   nodes:              CardNode[];
   edges:              [number, number, number][];
   highlightedIndices: number[] | null;
+  selectedNodeIdx:    number | null;
   onNodeClick:        (idx: number) => void;
   selectedColors:     Set<string>;
   colorMode:          'including' | 'exactly';
@@ -25,7 +26,7 @@ function edgeWidth(jaccard: number):   number { return 0.5 + 2.5 * jaccard; }
 function edgeOpacity(jaccard: number): number { return Math.max(0.06, Math.min(0.55, 0.1 + 0.45 * jaccard)); }
 function nodeSize(deckCount: number, maxDeck: number): number { return 6 + 20 * Math.sqrt(deckCount / maxDeck); }
 
-export function ForceGraph({ nodes, edges, highlightedIndices, onNodeClick, selectedColors, colorMode }: Props) {
+export function ForceGraph({ nodes, edges, highlightedIndices, selectedNodeIdx, onNodeClick, selectedColors, colorMode }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cyRef        = useRef<Cytoscape.Core | null>(null);
   const clickRef     = useRef(onNodeClick);
@@ -149,30 +150,51 @@ export function ForceGraph({ nodes, edges, highlightedIndices, onNodeClick, sele
     return () => { cy.destroy(); cyRef.current = null; };
   }, [nodes, edges, committed, selectedColors, colorMode]);
 
-  // ── Search highlights ─────────────────────────────────────────────────────
+  // ── Highlight effect — search takes precedence over selection ────────────
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
 
-    if (!highlightedIndices || highlightedIndices.length === 0) {
-      cy.elements().removeClass('highlighted dimmed');
-      updateEdgeVisRef.current();
-      return;
-    }
+    const hasSearch    = highlightedIndices && highlightedIndices.length > 0;
+    const hasSelection = selectedNodeIdx !== null;
 
-    const hitSet = new Set(highlightedIndices.map(String));
-    cy.batch(() => {
-      cy.nodes().forEach(n => {
-        if (hitSet.has(n.id())) n.addClass('highlighted').removeClass('dimmed');
-        else                    n.addClass('dimmed').removeClass('highlighted');
+    if (hasSearch) {
+      const hitSet = new Set(highlightedIndices!.map(String));
+      cy.batch(() => {
+        cy.nodes().forEach(n => {
+          if (hitSet.has(n.id())) n.addClass('highlighted').removeClass('dimmed');
+          else                    n.addClass('dimmed').removeClass('highlighted');
+        });
+        cy.edges().forEach(e => {
+          const connected = hitSet.has(e.source().id()) || hitSet.has(e.target().id());
+          if (connected) e.removeClass('dimmed'); else e.addClass('dimmed');
+        });
       });
-      cy.edges().forEach(e => {
-        const connected = hitSet.has(e.source().id()) || hitSet.has(e.target().id());
-        if (connected) e.removeClass('dimmed'); else e.addClass('dimmed');
+    } else if (hasSelection) {
+      const selId      = String(selectedNodeIdx);
+      const neighborIds = new Set<string>();
+      cy.getElementById(selId).connectedEdges().forEach((e: Cytoscape.EdgeSingular) => {
+        const src = e.source().id(); const tgt = e.target().id();
+        if (src !== selId) neighborIds.add(src);
+        if (tgt !== selId) neighborIds.add(tgt);
       });
-    });
+      cy.batch(() => {
+        cy.nodes().forEach(n => {
+          if (n.id() === selId || neighborIds.has(n.id()))
+            n.addClass('highlighted').removeClass('dimmed');
+          else
+            n.addClass('dimmed').removeClass('highlighted');
+        });
+        cy.edges().forEach(e => {
+          const connected = e.source().id() === selId || e.target().id() === selId;
+          if (connected) e.removeClass('dimmed'); else e.addClass('dimmed');
+        });
+      });
+    } else {
+      cy.elements().removeClass('highlighted dimmed');
+    }
     updateEdgeVisRef.current();
-  }, [highlightedIndices]);
+  }, [highlightedIndices, selectedNodeIdx]);
 
   // ── Show/hide edges toggle ────────────────────────────────────────────────
   useEffect(() => { updateEdgeVisRef.current(); }, [showEdges]);

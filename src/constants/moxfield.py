@@ -17,7 +17,8 @@ HEADERS = {
 
 RATE_LIMIT_SECONDS    = 1.0
 DEFAULT_BATCH_SIZE    = 50
-CLAIM_TIMEOUT_MINUTES = 30
+CLAIM_TIMEOUT_MINUTES = 30      # lease length for an in-progress card sweep
+REFRESH_INTERVAL_HOURS = 24     # how often a fully-swept card is re-swept for new decks
 
 COLOR_BITS: dict[str, int] = {"W": 1, "U": 2, "B": 4, "R": 8, "G": 16}
 

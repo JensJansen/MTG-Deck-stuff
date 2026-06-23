@@ -30,6 +30,41 @@ export interface GraphData {
 
 export interface Manifest {
   formats: string[];
+  archetype_formats?: string[];
+}
+
+// ── Archetype visualization types ──────────────────────────────────────────
+
+export interface ArchetypeTopCard {
+  card:     string;
+  pct:      number;
+  avg_qty?: number;
+}
+
+export interface ArchetypeKeystoneCard {
+  card:  string;
+  p_in:  number;
+  p_out: number;
+  diff:  number;
+}
+
+export interface ArchetypeNode {
+  id:            number;
+  level:         1 | 2;
+  parent_id:     number | null;
+  name:          string | null;
+  member_count:  number;
+  meta_share:    number | null;
+  top_cards:     ArchetypeTopCard[] | null;
+  color_profile: Partial<Record<'W' | 'U' | 'B' | 'R' | 'G', number>> | null;
+  cmc_curve:     number[] | null;
+  keystone_cards: ArchetypeKeystoneCard[] | null;
+}
+
+export interface ArchetypeData {
+  format:           string;
+  total_classified: number;
+  archetypes:       ArchetypeNode[];
 }
 
 /** Compact focus partner tuple: [cardName, coOccurrenceCount, lift] */

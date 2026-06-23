@@ -19,6 +19,7 @@ Usage:
 
     result = clf.classify_cards(["Lightning Bolt", "Goblin Guide", ...])
 """
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,13 @@ import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import DATABASE_URL
+
+_FORMAT_TABLE: dict[str, str] = {"highlanderCanadian": "canadian_highlander"}
+_SINGLETON_FORMATS = frozenset(["commander", "highlanderCanadian"])
+
+
+def _table_prefix(fmt: str) -> str:
+    return _FORMAT_TABLE.get(fmt, fmt)
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
@@ -120,7 +128,10 @@ class DeckClassifier:
             model.eval()
             self._card_embeddings = model.card_embedding.weight.detach().numpy()
         except (OSError, KeyError, RuntimeError, ImportError) as e:
-            print(f"  Warning: could not load embeddings ({e}). Falling back to keystone-only classification.")
+            ckpt_display = os.environ.get("MODEL_CHECKPOINT") or "(MODEL_CHECKPOINT not set)"
+            print(f"  Warning: could not load embeddings — {type(e).__name__}: {e}")
+            print(f"    checkpoint: {ckpt_display}")
+            print(f"  Falling back to keystone-only classification.")
 
     def _match_keystones(self, card_set: set[str], keystones: list[dict]) -> list[str]:
         """Return keystone card names present in the deck."""
@@ -154,19 +165,32 @@ class DeckClassifier:
 
     def classify_deck_id(self, deck_id: str) -> dict:
         """Look up a deck from the DB by public_id and classify it."""
-        with self._conn.cursor() as cur:
-            cur.execute("""
-                SELECT c.card_name
-                FROM deck_cards dc
-                JOIN cards c ON c.id = dc.card_id
-                WHERE dc.deck_id = %s
-                  AND dc.board   = 'mainboard'
-                  AND c.type_line NOT LIKE '%%Land%%'
-            """, (deck_id,))
-            card_names = [row[0] for row in cur.fetchall()]
+        prefix = _table_prefix(self.fmt)
+        if self.fmt in _SINGLETON_FORMATS:
+            with self._conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT c.card_name
+                    FROM {prefix}_decks d
+                    CROSS JOIN LATERAL jsonb_array_elements(d.cards) AS elem
+                    JOIN cards c ON c.card_name = elem->>'card_name'
+                    WHERE d.public_id = %s
+                      AND c.type_line NOT LIKE '%%Land%%'
+                """, (deck_id,))
+                card_names = [row[0] for row in cur.fetchall()]
+        else:
+            with self._conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT c.card_name
+                    FROM {prefix}_deck_cards dc
+                    JOIN cards c ON c.id = dc.card_id
+                    WHERE dc.deck_id = %s
+                      AND dc.board   = 'mainboard'
+                      AND c.type_line NOT LIKE '%%Land%%'
+                """, (deck_id,))
+                card_names = [row[0] for row in cur.fetchall()]
 
         if not card_names:
-            return {"error": f"No mainboard cards found for deck {deck_id!r}"}
+            return {"error": f"No non-land mainboard cards found for deck {deck_id!r}"}
 
         return self.classify_cards(card_names)
 

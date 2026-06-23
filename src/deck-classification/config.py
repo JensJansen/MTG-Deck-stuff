@@ -19,17 +19,23 @@ MODEL_CHECKPOINT = os.environ.get("MODEL_CHECKPOINT", None)
 
 # ── UMAP (Level 1 dimensionality reduction) ────────────────────────────────────
 UMAP_N_COMPONENTS = 15
-UMAP_N_NEIGHBORS  = 30
-UMAP_MIN_DIST     = 0.0       # tighter clusters in embedding space
+UMAP_N_NEIGHBORS  = 60        # larger = more global structure, fewer micro-clusters
+UMAP_MIN_DIST     = 0.05      # slight spread discourages noise micro-clusters
 UMAP_METRIC       = "cosine"
 UMAP_RANDOM_STATE = 42
 
 # ── HDBSCAN Level 1 (coarse archetypes) ───────────────────────────────────────
 # min_cluster_size is set dynamically as max(L1_MIN_CLUSTER_ABS, frac × n_decks)
-L1_MIN_CLUSTER_FRAC = 0.001   # 0.1 % of format decks
-L1_MIN_CLUSTER_ABS  = 50      # absolute floor regardless of format size
+L1_MIN_CLUSTER_FRAC = 0.008   # 0.8 % of format decks (~1,250 for pauper)
+L1_MIN_CLUSTER_ABS  = 200     # absolute floor regardless of format size
 L1_MIN_SAMPLES      = 10      # controls cluster boundary conservatism
 L1_CLUSTER_METHOD   = "eom"   # "eom" finds more varied cluster sizes than "leaf"
+
+# ── Presence matrix: frequency filter for clustering ──────────────────────────
+# Cards appearing in more than this fraction of a format's decks are staples, not
+# archetype discriminators.  Filtered from UMAP / Level 2 input only — still
+# included in top_cards output for display.
+PRESENCE_MAX_FREQ = 0.08
 
 # ── Level 2 (sub-archetype detection) ─────────────────────────────────────────
 # A Level 1 cluster is eligible for sub-splitting if enough of its cards have

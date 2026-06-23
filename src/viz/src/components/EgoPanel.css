@@ -5,9 +5,17 @@
   display: flex; flex-direction: column; overflow: hidden;
 }
 
+/* ── Scrollable body (everything below art) ─────────────── */
+.ego-panel__scroll-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 /* ── Card art section ───────────────────────────────────── */
 .ego-panel__art-section { flex-shrink: 0; }
 
+.ego-panel__art-crop-wrap { overflow: hidden; transition: max-height 0.3s ease; }
 .ego-panel__art { line-height: 0; }
 .ego-panel__art img { width: 100%; display: block; }
 

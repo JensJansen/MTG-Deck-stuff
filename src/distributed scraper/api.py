@@ -7,6 +7,7 @@ Runs alongside the PostgreSQL database on the central host.
 Endpoints:
     GET  /health                   Liveness probe (no auth required)
     GET  /cards                    Card names for discovery nodes to iterate
+    POST /cards/claim              Atomically lease a batch of cards to a discovery node
     POST /decks                    Bulk-upsert discovered decks (routes by format)
     POST /decks/batch              Atomically claim a batch from a single format table
     POST /decks/cards/batch        Submit card rows for a batch of decks
@@ -33,7 +34,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from config import ALL_FORMATS, CLAIM_TIMEOUT_MINUTES, SINGLETON_FORMATS
+from config import ALL_FORMATS, CLAIM_TIMEOUT_MINUTES, REFRESH_INTERVAL_HOURS, SINGLETON_FORMATS
 from constants.env import load_env
 from db import get_connection, _get_pool
 
@@ -168,6 +169,12 @@ class UpsertResult(BaseModel):
 class BatchRequest(BaseModel):
     batch_size: int
     worker_id: str
+
+
+class ClaimRequest(BaseModel):
+    format: str
+    worker_id: str
+    batch_size: int = 5
 
 
 class DeckOut(BaseModel):
@@ -370,6 +377,61 @@ def mark_card_swept(_: Auth, card_name: str, req: SweptRequest) -> dict:
             )
         conn.commit()
     return {"ok": True}
+
+
+@app.post("/cards/claim", response_model=list[CardInfo])
+def claim_cards(_: Auth, req: ClaimRequest) -> list[CardInfo]:
+    """
+    Atomically lease up to batch_size cards of a single format to a discovery node.
+
+    Priority order, all in one query:
+      1. Unswept cards (full-sweep backlog), reclaiming leases older than
+         CLAIM_TIMEOUT_MINUTES.
+      2. Already-swept cards not processed within REFRESH_INTERVAL_HOURS
+         (incremental refresh), oldest first.
+
+    FOR UPDATE SKIP LOCKED guarantees concurrent nodes never receive the same
+    card. The returned fully_swept flag tells the node full vs incremental mode.
+    """
+    if req.format not in ALL_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unknown format: {req.format!r}")
+    swept_col = _format_col("swept", req.format)
+    legal_col = _format_col("legal", req.format)
+    at_col    = _format_col("claimed_at", req.format)
+    by_col    = _format_col("claimed_by", req.format)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH claimable AS (
+                    SELECT ss.card_name
+                    FROM   card_sweep_status ss
+                    JOIN   cards c ON c.card_name = ss.card_name
+                    WHERE  c.{legal_col} = 'legal'
+                      AND (
+                          (ss.{swept_col} = FALSE
+                           AND (ss.{at_col} IS NULL
+                                OR ss.{at_col} < NOW() - (%s * INTERVAL '1 minute')))
+                       OR (ss.{swept_col} = TRUE
+                           AND (ss.{at_col} IS NULL
+                                OR ss.{at_col} < NOW() - (%s * INTERVAL '1 hour')))
+                      )
+                    ORDER  BY ss.{swept_col} ASC, ss.{at_col} ASC NULLS FIRST, ss.card_name
+                    LIMIT  %s
+                    FOR UPDATE OF ss SKIP LOCKED
+                )
+                UPDATE card_sweep_status ss
+                SET    {at_col} = NOW(), {by_col} = %s
+                FROM   claimable cl
+                WHERE  ss.card_name = cl.card_name
+                RETURNING ss.card_name, ss.{swept_col}
+                """,
+                (CLAIM_TIMEOUT_MINUTES, REFRESH_INTERVAL_HOURS, req.batch_size, req.worker_id),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+    log.info("claim_cards[%s]: leased %d card(s) to %s", req.format, len(rows), req.worker_id)
+    return [CardInfo(name=r[0], fully_swept=r[1]) for r in rows]
 
 
 @app.post("/decks", response_model=UpsertResult)

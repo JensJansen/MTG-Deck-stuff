@@ -1,0 +1,165 @@
+/* ── Shell ───────────────────────────────────────────────── */
+.colors-view {
+  position: absolute; inset: 0;
+  overflow-y: auto;
+  padding: 20px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── Card (shared panel) ─────────────────────────────────── */
+.cv-card {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+}
+
+/* ── Section label ───────────────────────────────────────── */
+.cv-section-label {
+  font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--text-faint);
+  margin-bottom: 12px;
+}
+.cv-heatmap-hint {
+  font-size: 11px; color: var(--text-faint);
+  margin: -6px 0 12px; line-height: 1.5;
+}
+
+/* ── Top row ─────────────────────────────────────────────── */
+.cv-top-row {
+  display: flex;
+  gap: 16px;
+  align-items: stretch;
+}
+.cv-donut-card    { flex-shrink: 0; display: flex; flex-direction: column; }
+.cv-heatmap-card  { flex-shrink: 0; }
+.cv-boxplot-card  { flex: 1; min-width: 0; }
+.cv-archbars-card { flex: 1; min-width: 0; overflow-y: auto; }
+
+/* ── Donut ───────────────────────────────────────────────── */
+.cv-donut-inner {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+.cv-donut-legend {
+  display: flex; flex-direction: column; gap: 5px;
+  min-width: 130px;
+}
+.cv-legend-item  { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.cv-legend-dot   { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.cv-legend-name  { flex: 1; color: var(--text-muted); }
+.cv-legend-pct   { color: var(--text-primary); font-variant-numeric: tabular-nums; min-width: 36px; text-align: right; }
+
+/* ── Heatmap ─────────────────────────────────────────────── */
+.cv-heatmap {
+  display: grid;
+  grid-template-columns: 20px repeat(5, 40px);
+  grid-template-rows: 20px repeat(5, 40px);
+  gap: 3px;
+}
+.cv-heatmap-header {
+  font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
+.cv-heatmap-cell {
+  width: 40px; height: 40px;
+  border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity 0.12s;
+  cursor: default;
+}
+.cv-heatmap-cell:hover { opacity: 1 !important; }
+.cv-heatmap-val {
+  font-size: 9px; font-weight: 700; color: #fff;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+  pointer-events: none;
+}
+
+/* ── Per-color grid ──────────────────────────────────────── */
+.cv-per-color-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 10px;
+}
+.cv-color-panel {
+  border: 1px solid var(--border);
+  border-top-width: 2px;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.cv-color-panel__header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.cv-color-pip {
+  width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700; flex-shrink: 0;
+}
+.cv-color-panel__name { color: var(--text-muted); font-size: 11px; }
+.cv-color-panel__stats {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.cv-mini-stat { display: flex; justify-content: space-between; align-items: baseline; }
+.cv-mini-stat__label { font-size: 10px; color: var(--text-faint); }
+.cv-mini-stat__value { font-size: 11px; font-weight: 500; color: var(--text-primary); }
+.cv-color-panel__top {
+  padding: 6px 10px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.cv-top-row-item {
+  display: grid;
+  grid-template-columns: 1fr 44px 32px;
+  align-items: center; gap: 5px;
+}
+.cv-top-name {
+  font-size: 10px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cv-top-bar-wrap {
+  height: 4px; background: rgba(255,255,255,0.07);
+  border-radius: 2px; overflow: hidden;
+}
+.cv-top-bar { height: 100%; border-radius: 2px; opacity: 0.75; }
+.cv-top-pct { font-size: 9px; color: var(--text-faint); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ── Box plots ───────────────────────────────────────────── */
+.cv-boxplot-wrap { width: 100%; }
+
+/* ── Archetype color bars ────────────────────────────────── */
+.cv-arch-bars { display: flex; flex-direction: column; gap: 5px; }
+.cv-arch-row {
+  display: grid;
+  grid-template-columns: 160px 1fr 44px;
+  align-items: center; gap: 10px;
+}
+.cv-arch-label {
+  font-size: 11px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  text-align: right;
+}
+.cv-arch-bar-wrap {
+  height: 14px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 3px; overflow: hidden;
+}
+.cv-arch-bar {
+  height: 100%; display: flex;
+  border-radius: 3px; overflow: hidden;
+  min-width: 3px;
+}
+.cv-arch-seg { height: 100%; }
+.cv-arch-share {
+  font-size: 10px; color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
