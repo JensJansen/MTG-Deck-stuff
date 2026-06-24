@@ -1,21 +1,17 @@
 """
-visualize.py - Compute UMAP layout and export JSON for the React visualization app.
+visualize.py - Export JSON for the React visualization app.
 
-Reads co-occurrence stats from the database, projects cards to 2D with UMAP,
-stores coordinates in {format}_card_layout, then exports JSON files to
-src/viz/public/data/ for the React frontend.
+Reads pre-computed layout and co-occurrence stats from the database and writes
+JSON files to src/viz/public/data/ for the React frontend.
 
-Step 1 (per format): reads {format}_card_pair_stats → UMAP → {format}_card_layout
-Step 2 (per format): reads {format}_card_layout + stats → JSON export
-
-Supports all formats (pauper, modern, vintage, legacy, commander, highlanderCanadian).
-Run compute_stats.py first to populate the stats tables.
+Run refresh_stats.py first to populate card_stats, card_pair_stats, and
+card_layout. This script is a pure exporter — all computation happens in
+refresh_stats.py.
 
 Usage:
     python src/viz/visualize.py
     python src/viz/visualize.py --format pauper
     python src/viz/visualize.py --format commander
-    python src/viz/visualize.py --format modern --min-decks 10 --min-cooccur 10
 
 Reads DATABASE_URL from src/distributed scraper/.env automatically.
 """
@@ -30,21 +26,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import psycopg2
-import umap
-from scipy.sparse import csr_matrix
 
 from constants.env import load_env
-from constants.mtg import encode_colors, ALL_FORMATS, REGULAR_FORMATS, format_to_table_prefix
+from constants.mtg import encode_colors, ALL_FORMATS, format_to_table_prefix
 
 OUTPUT_DIR = Path(__file__).parent / "public" / "data"
-
-DEFAULT_MIN_DECKS   = 5
-DEFAULT_MIN_COOCCUR = 20
 
 EGO_TOP_N         = 50
 EGO_MIN_COOCCUR   = 5
 GRAPH_MIN_COOCCUR = 20
-FOCUS_MIN_COOCCUR = 5
 
 
 # ---------------------------------------------------------------------------
@@ -70,83 +60,10 @@ def get_formats(conn, fmt_filter: str | None) -> list[str]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# Layout (UMAP)
-# ---------------------------------------------------------------------------
-
-def compute_umap_layout(
-    card_list: list[str],
-    pairs: list[tuple[str, str, float]],
-) -> dict[str, tuple[float, float]]:
-    """
-    Build a sparse Jaccard similarity matrix and project to 2D with UMAP.
-    Cards with similar co-occurrence partners end up near each other.
-    Returns {card_name: (x, y)}.
-    """
-    n = len(card_list)
-    idx = {name: i for i, name in enumerate(card_list)}
-
-    row_idx, col_idx, vals = [], [], []
-    for a, b, jac in pairs:
-        i, j = idx[a], idx[b]
-        row_idx.extend([i, j])
-        col_idx.extend([j, i])
-        vals.extend([jac, jac])
-
-    X = csr_matrix((vals, (row_idx, col_idx)), shape=(n, n))
-
-    n_neighbors = min(15, n - 1)
-    reducer = umap.UMAP(
-        n_components=2,
-        metric="cosine",
-        n_neighbors=n_neighbors,
-        min_dist=0.05,
-        random_state=42,
-        low_memory=True,
-        verbose=False,
-    )
-    embedding = reducer.fit_transform(X)
-
-    return {card_list[i]: (float(embedding[i, 0]), float(embedding[i, 1])) for i in range(n)}
-
-
-def build_layout(conn, prefix: str, min_decks: int, min_cooccur: int) -> bool:
+def _has_layout(conn, prefix: str) -> bool:
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM get_layout_cards(%s, %s)", (prefix, min_decks))
-        card_rows = cur.fetchall()
-
-    if not card_rows:
-        print("  No cards meet the threshold — run compute_stats.py first.")
-        return False
-
-    if len(card_rows) < 2:
-        print("  Too few cards for layout, skipping.")
-        return False
-
-    print(f"  {len(card_rows)} cards (deck_count >= {min_decks})")
-
-    color_ids = {r[0]: r[2] for r in card_rows}
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM get_layout_pairs(%s, %s, %s)", (prefix, min_decks, min_cooccur))
-        pairs = cur.fetchall()
-    print(f"  {len(pairs)} pairs (cooccurrence >= {min_cooccur})")
-
-    card_list = sorted(color_ids)
-    print(f"  Running UMAP (n_neighbors={min(15, len(card_list)-1)}, min_dist=0.05)...",
-          end=" ", flush=True)
-    pos = compute_umap_layout(card_list, pairs)
-    print("done")
-
-    layout = [
-        {"card_name": card, "x": pos[card][0], "y": pos[card][1], "color_identity": color_ids.get(card, "")}
-        for card in card_list
-    ]
-    with conn.cursor() as cur:
-        cur.execute("CALL store_card_layout(%s, %s)", (prefix, json.dumps(layout)))
-    conn.commit()
-    print(f"  Stored layout for {len(layout)} cards.")
-    return True
+        cur.execute(f"SELECT EXISTS(SELECT 1 FROM {prefix}_card_layout LIMIT 1)")
+        return cur.fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +153,7 @@ def load_focus(pair_rows: list[tuple]) -> dict[str, list]:
 
 
 def export_format(conn, fmt: str, prefix: str, output_dir: Path) -> None:
-    nodes = load_nodes(conn, prefix)
+    nodes       = load_nodes(conn, prefix)
     card_names  = {n["name"] for n in nodes}
     name_to_idx = {n["name"]: i for i, n in enumerate(nodes)}
 
@@ -264,24 +181,29 @@ def export_format(conn, fmt: str, prefix: str, output_dir: Path) -> None:
 
 
 def write_manifest(output_dir: Path, formats: list[str]) -> None:
-    manifest = {"formats": formats}
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
-    )
+    manifest_path = output_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        manifest = {}
+    manifest["formats"] = formats
+    manifest_path.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def run(conn, formats: list[str], min_decks: int, min_cooccur: int) -> list[str]:
+def run(conn, formats: list[str]) -> list[str]:
     exported = []
     for fmt in formats:
         prefix = format_to_table_prefix(fmt)
         print(f"\n[{fmt}]")
-        if build_layout(conn, prefix, min_decks, min_cooccur):
-            export_format(conn, fmt, prefix, OUTPUT_DIR)
-            exported.append(fmt)
+        if not _has_layout(conn, prefix):
+            print("  No layout found — run refresh_stats.py first.")
+            continue
+        export_format(conn, fmt, prefix, OUTPUT_DIR)
+        exported.append(fmt)
     return exported
 
 
@@ -291,14 +213,13 @@ def run(conn, formats: list[str], min_decks: int, min_cooccur: int) -> list[str]
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compute UMAP layout and export JSON for the React visualization app."
+        description="Export JSON for the React visualization app. "
+                    "Run refresh_stats.py first to compute layout and stats."
     )
-    parser.add_argument("--format", "-f", dest="format", default=None,
-                        help=f"Limit to one format (default: all). Choices: {', '.join(ALL_FORMATS)}")
-    parser.add_argument("--min-decks", dest="min_decks", type=int, default=DEFAULT_MIN_DECKS,
-                        help=f"Minimum deck count to include a card (default: {DEFAULT_MIN_DECKS})")
-    parser.add_argument("--min-cooccur", dest="min_cooccur", type=int, default=DEFAULT_MIN_COOCCUR,
-                        help=f"Minimum co-occurrence count for layout edges (default: {DEFAULT_MIN_COOCCUR})")
+    parser.add_argument(
+        "--format", "-f", dest="format", default=None,
+        help=f"Limit to one format (default: all). Choices: {', '.join(ALL_FORMATS)}",
+    )
     args = parser.parse_args()
 
     if args.format and args.format not in ALL_FORMATS:
@@ -318,16 +239,14 @@ def main() -> None:
     try:
         formats = get_formats(conn, args.format)
         if not formats:
-            print("No stats data found — run compute_stats.py first.")
+            print("No stats data found — run refresh_stats.py first.")
             return
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"Formats:     {', '.join(formats)}")
-        print(f"Min decks:   {args.min_decks}")
-        print(f"Min cooccur: {args.min_cooccur}")
-        print(f"Output:      {OUTPUT_DIR}")
+        print(f"Formats: {', '.join(formats)}")
+        print(f"Output:  {OUTPUT_DIR}")
 
-        exported = run(conn, formats, args.min_decks, args.min_cooccur)
+        exported = run(conn, formats)
     finally:
         conn.close()
 

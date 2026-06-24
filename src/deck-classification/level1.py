@@ -5,7 +5,7 @@ Takes deck embeddings (or a card-presence matrix as fallback) and returns
 cluster labels and soft membership probabilities for each deck.
 
 Typical call from pipeline.py:
-    labels, probs = run(embeddings, n_decks=len(deck_ids), fmt="pauper")
+    l1_labels, l1_probs = run(embeddings, n_decks=len(deck_ids), fmt="pauper")
 """
 import sys
 from pathlib import Path
@@ -76,19 +76,18 @@ def run(
     embeddings: np.ndarray,
     n_decks: int,
     fmt: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Full Level 1 pipeline.
 
     Returns:
-        reduced : (N, UMAP_N_COMPONENTS) float32 — UMAP coordinates (used by Level 2)
         labels  : (N,) int32
         probs   : (N,) float32
     """
     print(f"\n── Level 1  [{fmt}]  {n_decks:,} decks ─────────────────────────────")
-    reduced        = _reduce(embeddings)
-    labels, probs  = _cluster(reduced, n_decks)
-    return reduced, labels, probs
+    reduced       = _reduce(embeddings)
+    labels, probs = _cluster(reduced, n_decks)
+    return labels, probs
 
 
 def cluster_summary(labels: np.ndarray) -> dict[int, int]:

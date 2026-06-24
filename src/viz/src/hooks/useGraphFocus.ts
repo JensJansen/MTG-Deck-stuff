@@ -67,9 +67,11 @@ function buildFocusGraphData(
   // ----------------------------------------------------------------
   // Log-normalise co-occurrence counts for edge length encoding.
   // ----------------------------------------------------------------
-  const maxCount = Math.max(...depth1Map.values(), 1);
+  const counts   = [...depth1Map.values()];
+  const maxCount = Math.max(...counts, 1);
+  const minCount = Math.min(...counts, maxCount);
   const logMax   = Math.log(maxCount);
-  const logMin   = Math.log(5);
+  const logMin   = Math.log(Math.max(minCount, 1));
   const logRange = logMax > logMin ? logMax - logMin : 1;
 
   // ----------------------------------------------------------------
@@ -166,6 +168,7 @@ export function useGraphFocus(
     let fd = focusData;
     if (!fd || focusDataFormat !== format) {
       const res = await fetch(`/data/${format}.focus.json`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       fd = await res.json() as FocusData;
       setFocusData(fd);
       setFocusDataFormat(format);

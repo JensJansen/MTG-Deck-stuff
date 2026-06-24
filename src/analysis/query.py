@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import psycopg2
 
 from constants.env import load_env
-from constants.mtg import REGULAR_FORMATS
+from constants.mtg import REGULAR_FORMATS, format_to_table_prefix
 
 SORT_CHOICES = ["lift", "pmi", "jaccard", "confidence", "cooccurrence_count"]
 
@@ -37,9 +37,10 @@ _VALID_SORT_COLS: frozenset[str] = frozenset(SORT_CHOICES)
 
 def get_canonical_name(conn, card_name: str, fmt: str) -> str | None:
     """Return the DB-canonical casing for card_name in fmt (case-insensitive), or None."""
+    prefix = format_to_table_prefix(fmt)
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT card_name FROM {fmt}_card_stats WHERE lower(card_name) = lower(%s) LIMIT 1",
+            f"SELECT card_name FROM {prefix}_card_stats WHERE lower(card_name) = lower(%s) LIMIT 1",
             (card_name,)
         )
         row = cur.fetchone()
@@ -47,8 +48,9 @@ def get_canonical_name(conn, card_name: str, fmt: str) -> str | None:
 
 
 def fuzzy_candidates(conn, card_name: str, fmt: str, n: int = 3) -> list[str]:
+    prefix = format_to_table_prefix(fmt)
     with conn.cursor() as cur:
-        cur.execute(f"SELECT card_name FROM {fmt}_card_stats")
+        cur.execute(f"SELECT card_name FROM {prefix}_card_stats")
         all_names = [r[0] for r in cur.fetchall()]
     return difflib.get_close_matches(card_name, all_names, n=n, cutoff=0.6)
 
@@ -85,7 +87,7 @@ def resolve_card_name(conn, card_name: str, fmt: str) -> str | None:
     candidates = fuzzy_candidates(conn, card_name, fmt)
     if not candidates:
         print(f"No card matching '{card_name}' found in {fmt}, and no close matches exist.")
-        print("Have you run compute_stats.py for this format?")
+        print("Have you run refresh_stats.py for this format?")
         return None
 
     return prompt_fuzzy_selection(candidates)
@@ -96,10 +98,11 @@ def resolve_card_name(conn, card_name: str, fmt: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def card_stats(conn, card_name: str, fmt: str) -> list[dict]:
+    prefix = format_to_table_prefix(fmt)
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT deck_count, total_decks, inclusion_rate, avg_quantity
-            FROM {fmt}_card_stats
+            FROM {prefix}_card_stats
             WHERE card_name = %s
         """, (card_name,))
         row = cur.fetchone()
@@ -118,13 +121,14 @@ def pair_stats(
 ) -> list[dict]:
     if sort_by not in _VALID_SORT_COLS:
         raise ValueError(f"Invalid sort column: {sort_by!r}")
+    prefix = format_to_table_prefix(fmt)
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT
                 CASE WHEN card_a = %s THEN card_b ELSE card_a END AS partner,
                 cooccurrence_count, lift, pmi, jaccard,
                 CASE WHEN card_a = %s THEN confidence_a_to_b ELSE confidence_b_to_a END AS confidence
-            FROM {fmt}_card_pair_stats
+            FROM {prefix}_card_pair_stats
             WHERE (card_a = %s OR card_b = %s)
             ORDER BY {sort_by} DESC
             LIMIT %s
@@ -139,7 +143,7 @@ def pair_stats(
 
 def print_card_stats(rows: list[dict], card_name: str) -> None:
     if not rows:
-        print(f"  No stats found for '{card_name}'. Have you run compute_stats.py?")
+        print(f"  No stats found for '{card_name}'. Have you run refresh_stats.py?")
         return
     print(f"  {'Format':<18} {'Decks':>6}  {'Total':>6}  {'Inclusion':>10}  {'Avg qty':>8}")
     print(f"  {'-'*18}  {'-'*6}  {'-'*6}  {'-'*10}  {'-'*8}")

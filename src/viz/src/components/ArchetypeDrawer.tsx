@@ -97,7 +97,7 @@ function DrawerContent({ archetype, data, onClose }: {
                     </td>
                     <td className="arch-drawer__td arch-drawer__td--num"
                       style={{ color: diffColor(k.diff) }}>
-                      +{(k.diff * 100).toFixed(0)}%
+                      {k.diff >= 0 ? '+' : ''}{(k.diff * 100).toFixed(0)}%
                     </td>
                   </tr>
                 ))}

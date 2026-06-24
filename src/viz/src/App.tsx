@@ -41,12 +41,13 @@ export function App() {
   const { focusedNode, isFocused, focusGraphData, applyFocus, resetFocus } =
     useGraphFocus(data?.nodes ?? [], data?.edges ?? [], selectedFormat, data?.ego ?? {}, selectedColors, colorMode);
 
-  const [focusPill, setFocusPill] = useState(false);
+
+  const [focusPill, setFocusPill] = useState<string | null>(null);
   const pillTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  function showFocusPill() {
+  function showPill(text: string) {
     if (pillTimer.current) clearTimeout(pillTimer.current);
-    setFocusPill(true);
-    pillTimer.current = setTimeout(() => setFocusPill(false), 5000);
+    setFocusPill(text);
+    pillTimer.current = setTimeout(() => setFocusPill(null), 5000);
   }
 
   const nameIndex = useMemo<Record<string, number>>(() => {
@@ -137,7 +138,12 @@ export function App() {
 
         {/* Top bar — dedicated row, never overlaps content */}
         <div className="app-topbar">
-          <ViewToggle mode={viewMode} onSwitch={setViewMode} hasArchetypes={hasArchetypes} />
+          <ViewToggle mode={viewMode} onSwitch={mode => {
+            setViewMode(mode);
+            setDrawerOpen(false);
+            setArchetypeDrawerOpen(false);
+            setSelectedNodeIdx(null);
+          }} hasArchetypes={hasArchetypes} />
         </div>
 
         {/* View content — fills remaining space */}
@@ -263,12 +269,20 @@ export function App() {
       {/* Right panels (outside app-main, always mounted) */}
       <EgoPanel node={selectedNode} partners={partners} nameIndex={nameIndex} nodes={data.nodes}
         onClose={handlePanelClose}
-        onRefocus={() => { if (selectedNodeIdx !== null) { showFocusPill(); applyFocus(selectedNodeIdx).catch(console.error); } }}
+        onRefocus={() => {
+          if (selectedNodeIdx !== null) {
+            showPill('Loading focus view…');
+            applyFocus(selectedNodeIdx).catch((e: unknown) => {
+              console.error('applyFocus failed:', e);
+              showPill('Failed to load focus data');
+            });
+          }
+        }}
         onViewStats={() => setDrawerOpen(true)}
         onNodeClick={handlePartnerClick}
       />
 
-      {focusPill && <div className="focus-toast">Loading focus view…</div>}
+      {focusPill && <div className="focus-toast">{focusPill}</div>}
 
       <StatsDrawer open={drawerOpen} node={selectedNode} partners={partners}
         onClose={() => setDrawerOpen(false)} onNodeClick={handlePartnerClick} />

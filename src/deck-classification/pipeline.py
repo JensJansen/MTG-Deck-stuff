@@ -44,8 +44,36 @@ def _compute_or_load_features(fmt: str, conn, recompute: bool, color_mask: int |
     need_presence   = recompute or not cached["presence"]
     need_embeddings = bool(checkpoint) and (recompute or not cached["embeddings"])
 
-    # Always load deck_ids once — fast query, guarantees consistency across features.
-    deck_ids = feat.load_deck_ids(conn, fmt, color_mask)
+    # ── Structural + presence ──────────────────────────────────────────────────
+    # Cached matrices embed their own deck ordering.  When loading from cache,
+    # use the saved deck_ids so all matrices stay row-aligned.  Only query the
+    # DB when both features need fresh computation.
+    if need_structural and need_presence:
+        deck_ids = feat.load_deck_ids(conn, fmt, color_mask)
+        print("\n── Features: structural + presence (single DB pass) ──────────────")
+        pip_volumes, cmc_dists, presence, counts, card_vocab = \
+            feat.compute_all_features(deck_ids, conn, fmt)
+        feat.save_structural(fmt, deck_ids, pip_volumes, cmc_dists, color_mask)
+        feat.save_presence(fmt, deck_ids, presence, counts, card_vocab, color_mask)
+    elif need_structural:
+        # Presence is cached — use its deck ordering as the authority.
+        print("  Presence cache found → loading")
+        deck_ids, presence, counts, card_vocab = feat.load_presence(fmt, color_mask)
+        print("\n── Features: pip volumes + CMC distributions ─────────────────────")
+        pip_volumes, cmc_dists = feat.compute_structural_features(deck_ids, conn, fmt)
+        feat.save_structural(fmt, deck_ids, pip_volumes, cmc_dists, color_mask)
+    elif need_presence:
+        # Structural is cached — use its deck ordering as the authority.
+        print("  Structural cache found → loading")
+        deck_ids, pip_volumes, cmc_dists = feat.load_structural(fmt, color_mask)
+        print("\n── Features: card presence matrix ────────────────────────────────")
+        presence, counts, card_vocab = feat.compute_card_presence(deck_ids, conn, fmt)
+        feat.save_presence(fmt, deck_ids, presence, counts, card_vocab, color_mask)
+    else:
+        print("  Structural cache found → loading")
+        deck_ids, pip_volumes, cmc_dists = feat.load_structural(fmt, color_mask)
+        print("  Presence cache found → loading")
+        _, presence, counts, card_vocab = feat.load_presence(fmt, color_mask)
 
     # ── Embeddings ─────────────────────────────────────────────────────────────
     if need_embeddings:
@@ -58,30 +86,6 @@ def _compute_or_load_features(fmt: str, conn, recompute: bool, color_mask: int |
     else:
         print("  No MODEL_CHECKPOINT set and no cached embeddings — using card presence only")
         embeddings = None
-
-    # ── Structural + presence: single DB pass when both are needed ─────────────
-    if need_structural and need_presence:
-        print("\n── Features: structural + presence (single DB pass) ──────────────")
-        pip_volumes, cmc_dists, presence, counts, card_vocab = \
-            feat.compute_all_features(deck_ids, conn, fmt)
-        feat.save_structural(fmt, deck_ids, pip_volumes, cmc_dists, color_mask)
-        feat.save_presence(fmt, deck_ids, presence, counts, card_vocab, color_mask)
-    else:
-        if need_structural:
-            print("\n── Features: pip volumes + CMC distributions ─────────────────────")
-            pip_volumes, cmc_dists = feat.compute_structural_features(deck_ids, conn, fmt)
-            feat.save_structural(fmt, deck_ids, pip_volumes, cmc_dists, color_mask)
-        else:
-            print("  Structural cache found → loading")
-            _, pip_volumes, cmc_dists = feat.load_structural(fmt, color_mask)
-
-        if need_presence:
-            print("\n── Features: card presence matrix ────────────────────────────────")
-            presence, counts, card_vocab = feat.compute_card_presence(deck_ids, conn, fmt)
-            feat.save_presence(fmt, deck_ids, presence, counts, card_vocab, color_mask)
-        else:
-            print("  Presence cache found → loading")
-            _, presence, counts, card_vocab = feat.load_presence(fmt, color_mask)
 
     return deck_ids, embeddings, pip_volumes, cmc_dists, presence, counts, card_vocab
 
@@ -170,8 +174,7 @@ def run(fmt: str, recompute: bool = False, color_mask: int | None = None) -> Non
         # Fall back to card presence matrix if no embeddings available.
         # Sparse matrix is passed directly — no .toarray() needed for cosine UMAP.
         cluster_input = embeddings if embeddings is not None else presence_cluster
-        reduced, l1_labels, l1_probs = level1.run(cluster_input, N, fmt)
-        del reduced
+        l1_labels, l1_probs = level1.run(cluster_input, N, fmt)
         l1_summary = level1.cluster_summary(l1_labels)
 
         # ── 3. Level 2 ─────────────────────────────────────────────────────────

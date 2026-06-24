@@ -51,7 +51,7 @@ def write_archetypes(
     run_id: str,
     records: list[dict],
     color_mask: int | None = None,
-) -> dict[tuple[int, int], int]:
+) -> dict[tuple, int]:
     """
     Insert archetype rows and return a mapping of
     (level, local_cluster_id) → db_id so that deck assignments can reference them.

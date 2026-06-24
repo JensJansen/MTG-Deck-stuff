@@ -1,24 +1,32 @@
 """
-refresh_stats.py — Fast replacement for the refresh_singleton_format_stats stored proc.
+refresh_stats.py — Card co-occurrence statistics and 2D card layout for all formats.
 
-Uses scipy sparse matrix multiplication (M.T @ M) to compute card co-occurrence,
-replacing the SQL self-join that generates O(N_decks × cards²) staging rows and does
-not scale past a few hundred thousand decks.
+Replaces two separate steps that previously required a Postgres stored procedure
+(refresh_format_stats / refresh_singleton_format_stats) and a separate visualize.py
+layout pass:
 
-At 5.38M commander decks × 99 non-land cards/deck the SQL approach produces ~26 billion
-staging rows.  The sparse multiply handles the same data in a single BLAS call over
-~530M non-zero entries.
+  1. Streams deck-card presence from DB (or reuses the pipeline.py cache).
+  2. Computes co-occurrence via sparse matrix multiplication (M.T @ M) in Python.
+  3. Derives lift, PMI, jaccard, and confidence entirely in NumPy.
+  4. Writes {format}_card_stats and {format}_card_pair_stats.
+  5. Runs a card-space UMAP on the in-memory jaccard matrix and writes
+     {format}_card_layout — no extra DB round-trip.
 
-Peak RAM: roughly 5–8 GB for commander at current scale.  If the pipeline.py presence
+At 5.38M commander decks × 99 non-land cards/deck the SQL self-join approach
+produced ~26 billion staging rows. The sparse multiply handles the same data in a
+single BLAS call over ~530M non-zero entries.
+
+Peak RAM: roughly 5–8 GB for commander at current scale. If the pipeline.py presence
 cache exists for the format it is reused, skipping the expensive DB streaming pass.
 
-Works for both singleton and regular formats; the distinction is handled transparently
-by features.py.
+Works for both singleton and regular formats.
 
 Usage:
     python refresh_stats.py --format commander
-    python refresh_stats.py --format pauper --min-cooccur 5
-    python refresh_stats.py --format commander --min-card-decks 50 --recompute
+    python refresh_stats.py                              # run all formats
+    python refresh_stats.py --format pauper --min-cooccur 5 --min-card-decks 10
+    python refresh_stats.py --format commander --recompute   # ignore presence cache
+    python refresh_stats.py --format commander --skip-layout # stats only, no UMAP
 """
 
 import argparse
@@ -31,6 +39,7 @@ import numpy as np
 import psycopg2
 import psycopg2.extras
 import scipy.sparse as sp
+import umap
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parents[1]))
@@ -38,7 +47,27 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import features as feat
 from config import DATABASE_URL
 from constants.env import load_env
-from constants.mtg import ALL_FORMATS
+from constants.mtg import ALL_FORMATS, COLOR_BITS, format_to_table_prefix
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _decode_color_mask(mask: int | None) -> str:
+    if not mask:
+        return ""
+    return ",".join(c for c, b in COLOR_BITS.items() if mask & b)
+
+
+def _has_legality_column(conn, fmt: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns"
+            " WHERE table_name = 'cards' AND column_name = %s)",
+            (f"legal_{fmt}",),
+        )
+        return cur.fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -47,13 +76,13 @@ from constants.mtg import ALL_FORMATS
 
 def _write_card_stats(
     cur,
-    fmt: str,
+    prefix: str,
     card_vocab: list[str],
     deck_counts: np.ndarray,
     avg_qtys: np.ndarray,
     total_decks: int,
 ) -> int:
-    table = f"{fmt}_card_stats"
+    table = f"{prefix}_card_stats"
     cur.execute(f"TRUNCATE {table}")
     rows = [
         (
@@ -78,7 +107,7 @@ def _write_card_stats(
 
 def _write_pair_stats(
     conn,
-    fmt: str,
+    prefix: str,
     kept_vocab: list[str],
     kept_counts: np.ndarray,
     cooccur_upper: sp.csr_matrix,
@@ -86,7 +115,7 @@ def _write_pair_stats(
     min_cooccur: int,
     batch_size: int = 50_000,
 ) -> int:
-    table = f"{fmt}_card_pair_stats"
+    table = f"{prefix}_card_pair_stats"
 
     coo  = cooccur_upper.tocoo()
     mask = coo.data >= min_cooccur
@@ -145,6 +174,136 @@ def _write_pair_stats(
     return written
 
 
+def _print_sample(conn, prefix: str, limit: int = 5) -> None:
+    table = f"{prefix}_card_pair_stats"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT card_a, card_b, cooccurrence_count, lift, jaccard"
+            f" FROM {table} ORDER BY lift DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+    if rows:
+        print("  Top pairs by lift:")
+        for r in rows:
+            print(
+                f"    {r[0]:35s} + {r[1]:35s}"
+                f"  cooccur={r[2]:3d}  lift={r[3]:.2f}  jaccard={r[4]:.3f}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Card-space UMAP layout
+# ---------------------------------------------------------------------------
+
+def _run_layout(
+    conn,
+    fmt: str,
+    prefix: str,
+    card_vocab: list[str],
+    deck_counts: np.ndarray,
+    cooccur_upper: sp.csr_matrix,
+    kept_vocab: list[str],
+    kept_counts: np.ndarray,
+    min_decks: int,
+    min_cooccur: int,
+) -> None:
+    # Legality filter: some formats have a legal_{fmt} column on cards;
+    # singleton formats like highlanderCanadian do not (all cards pass).
+    has_legal = _has_legality_column(conn, fmt)
+    if has_legal:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT card_name FROM cards WHERE legal_{fmt} = 'legal'")
+            legal_set: set[str] | None = {row[0] for row in cur.fetchall()}
+    else:
+        legal_set = None
+
+    layout_cards: list[str] = [
+        name for i, name in enumerate(card_vocab)
+        if deck_counts[i] >= min_decks and (legal_set is None or name in legal_set)
+    ]
+
+    if len(layout_cards) < 2:
+        print("  Too few cards for layout, skipping.")
+        return
+
+    print(f"  {len(layout_cards)} cards (deck_count >= {min_decks})")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT card_name, ci_mask FROM cards WHERE card_name = ANY(%s)",
+            (layout_cards,),
+        )
+        color_ids = {row[0]: _decode_color_mask(row[1]) for row in cur.fetchall()}
+
+    # Build sparse jaccard similarity matrix from the in-memory co-occurrence data.
+    # Vectorised: filter by min_cooccur first, then by membership in layout_cards.
+    layout_set = set(layout_cards)
+    card_idx   = {name: i for i, name in enumerate(layout_cards)}
+    n = len(layout_cards)
+
+    coo          = cooccur_upper.tocoo()
+    cooccur_mask = coo.data >= min_cooccur
+    ri   = coo.row[cooccur_mask]
+    ci   = coo.col[cooccur_mask]
+    data = coo.data[cooccur_mask].astype(np.float64)
+
+    vocab_arr = np.asarray(kept_vocab)
+    names_a   = vocab_arr[ri]
+    names_b   = vocab_arr[ci]
+
+    in_layout = np.isin(names_a, list(layout_set)) & np.isin(names_b, list(layout_set))
+    names_a   = names_a[in_layout]
+    names_b   = names_b[in_layout]
+    na        = kept_counts[ri[in_layout]].astype(np.float64)
+    nb        = kept_counts[ci[in_layout]].astype(np.float64)
+    c         = data[in_layout]
+    jac_vals  = c / (na + nb - c)
+
+    i_idx = np.array([card_idx[name] for name in names_a])
+    j_idx = np.array([card_idx[name] for name in names_b])
+
+    row_idx = np.concatenate([i_idx, j_idx])
+    col_idx = np.concatenate([j_idx, i_idx])
+    vals    = np.concatenate([jac_vals, jac_vals])
+
+    X = sp.csr_matrix((vals, (row_idx, col_idx)), shape=(n, n))
+
+    n_neighbors = min(15, n - 1)
+    print(f"  Running UMAP ({n} cards, n_neighbors={n_neighbors})...", end=" ", flush=True)
+    reducer = umap.UMAP(
+        n_components=2,
+        metric="cosine",
+        n_neighbors=n_neighbors,
+        min_dist=0.05,
+        random_state=42,
+        low_memory=True,
+        verbose=False,
+    )
+    embedding = reducer.fit_transform(X)
+    print("done")
+
+    rows = [
+        (
+            layout_cards[i],
+            float(embedding[i, 0]),
+            float(embedding[i, 1]),
+            color_ids.get(layout_cards[i], ""),
+        )
+        for i in range(n)
+    ]
+
+    with conn.cursor() as cur:
+        cur.execute(f"DELETE FROM {prefix}_card_layout")
+        psycopg2.extras.execute_values(
+            cur,
+            f"INSERT INTO {prefix}_card_layout (card_name, x, y, color_identity) VALUES %s",
+            rows,
+        )
+    conn.commit()
+    print(f"  Layout stored: {len(rows)} cards.")
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -154,12 +313,16 @@ def run(
     min_cooccur: int = 5,
     min_card_decks: int = 20,
     recompute: bool = False,
+    layout_min_decks: int = 5,
+    layout_min_cooccur: int = 20,
+    skip_layout: bool = False,
 ) -> None:
     load_env()
     db_url = os.environ.get("DATABASE_URL", DATABASE_URL)
+    prefix = format_to_table_prefix(fmt)
     t0     = time.monotonic()
 
-    print(f"refresh_stats  format={fmt}  min_cooccur={min_cooccur}"
+    print(f"\nrefresh_stats  format={fmt}  min_cooccur={min_cooccur}"
           f"  min_card_decks={min_card_decks}")
 
     conn = psycopg2.connect(db_url)
@@ -190,7 +353,7 @@ def run(
 
     print("\nWriting card stats...")
     with conn.cursor() as cur:
-        n_cards = _write_card_stats(cur, fmt, card_vocab, deck_counts, avg_qtys, N)
+        n_cards = _write_card_stats(cur, prefix, card_vocab, deck_counts, avg_qtys, N)
     conn.commit()
     print(f"  Wrote {n_cards:,} rows")
 
@@ -207,7 +370,7 @@ def run(
     kept_vocab  = [card_vocab[i] for i, k in enumerate(keep_mask) if k]
     kept_counts = deck_counts[keep_mask]
 
-    del presence, counts  # release memory before the multiply
+    del presence, counts
 
     # ── 4. Sparse co-occurrence via M.T @ M ───────────────────────────────────
     print(f"\nComputing co-occurrence matrix ({n_kept:,} × {n_kept:,})...")
@@ -217,14 +380,27 @@ def run(
 
     del M
 
-    cooccur_upper = sp.triu(cooccur, k=1)  # upper triangle only, diagonal excluded
+    cooccur_upper = sp.triu(cooccur, k=1)
     del cooccur
 
     # ── 5. Write pair stats ───────────────────────────────────────────────────
     print("\nWriting pair stats...")
     n_pairs = _write_pair_stats(
-        conn, fmt, kept_vocab, kept_counts, cooccur_upper, N, min_cooccur,
+        conn, prefix, kept_vocab, kept_counts, cooccur_upper, N, min_cooccur,
     )
+    _print_sample(conn, prefix)
+
+    # ── 6. Card-space UMAP layout ─────────────────────────────────────────────
+    if not skip_layout:
+        print(f"\nComputing card layout"
+              f" (layout_min_decks={layout_min_decks}"
+              f"  layout_min_cooccur={layout_min_cooccur})...")
+        _run_layout(
+            conn, fmt, prefix,
+            card_vocab, deck_counts,
+            cooccur_upper, kept_vocab, kept_counts,
+            layout_min_decks, layout_min_cooccur,
+        )
 
     conn.close()
     elapsed = time.monotonic() - t0
@@ -237,27 +413,67 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Recompute card_stats and card_pair_stats for a format.",
+        description="Recompute card stats, pair stats, and card layout for one or all formats.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python refresh_stats.py --format commander
+  python refresh_stats.py                               # run all formats
   python refresh_stats.py --format pauper --min-cooccur 5 --min-card-decks 10
   python refresh_stats.py --format commander --recompute   # ignore presence cache
+  python refresh_stats.py --format commander --skip-layout # stats only, no UMAP
 """,
     )
-    parser.add_argument("--format", "-f", required=True, choices=ALL_FORMATS,
-                        help="MTG format to recompute stats for.")
-    parser.add_argument("--min-cooccur", type=int, default=5,
-                        help="Minimum co-occurrence count to include a pair (default 5).")
-    parser.add_argument("--min-card-decks", type=int, default=20,
-                        help="Exclude cards from pair computation that appear in fewer than"
-                             " this many decks (default 20). Does not affect card_stats output.")
-    parser.add_argument("--recompute", action="store_true",
-                        help="Re-stream deck-card data from DB even if a presence cache exists.")
+    parser.add_argument(
+        "--format", "-f", dest="format", default=None,
+        help=f"MTG format to process. Omit to run all formats. "
+             f"Choices: {', '.join(ALL_FORMATS)}",
+    )
+    parser.add_argument(
+        "--min-cooccur", type=int, default=5,
+        help="Minimum co-occurrence count to store a pair in pair_stats (default 5).",
+    )
+    parser.add_argument(
+        "--min-card-decks", type=int, default=20,
+        help="Exclude cards from pair computation that appear in fewer than this many"
+             " decks (default 20). Does not affect card_stats output.",
+    )
+    parser.add_argument(
+        "--layout-min-decks", type=int, default=5,
+        help="Minimum deck count for a card to appear in the layout (default 5).",
+    )
+    parser.add_argument(
+        "--layout-min-cooccur", type=int, default=20,
+        help="Minimum co-occurrence count for a pair to form a layout edge (default 20).",
+    )
+    parser.add_argument(
+        "--recompute", action="store_true",
+        help="Re-stream deck-card data from DB even if a presence cache exists.",
+    )
+    parser.add_argument(
+        "--skip-layout", action="store_true",
+        help="Skip the UMAP layout step (stats only).",
+    )
 
     args = parser.parse_args()
-    run(args.format, args.min_cooccur, args.min_card_decks, args.recompute)
+
+    if args.format is not None and args.format not in ALL_FORMATS:
+        print(f"ERROR: '{args.format}' is not a valid format.")
+        print(f"  Choices: {', '.join(ALL_FORMATS)}")
+        sys.exit(1)
+
+    formats = [args.format] if args.format else list(ALL_FORMATS)
+
+    for fmt in formats:
+        run(
+            fmt,
+            min_cooccur=args.min_cooccur,
+            min_card_decks=args.min_card_decks,
+            recompute=args.recompute,
+            layout_min_decks=args.layout_min_decks,
+            layout_min_cooccur=args.layout_min_cooccur,
+            skip_layout=args.skip_layout,
+        )
 
 
 if __name__ == "__main__":

@@ -199,14 +199,11 @@ class DeckClassifier:
         if not candidates:
             return None
 
-        if embedding is not None:
-            sims = [(a, _cosine_sim(embedding, a["centroid"])) for a in candidates]
-            best, confidence = max(sims, key=lambda x: x[1])
-        else:
-            # Fallback: pick largest archetype (no embedding available)
-            best       = max(candidates, key=lambda a: a["member_count"])
-            confidence = 0.0
+        if embedding is None:
+            return None
 
+        sims = [(a, _cosine_sim(embedding, a["centroid"])) for a in candidates]
+        best, confidence = max(sims, key=lambda x: x[1])
         return {"id": best["id"], "confidence": round(confidence, 4)}
 
     def _classify_l2(
