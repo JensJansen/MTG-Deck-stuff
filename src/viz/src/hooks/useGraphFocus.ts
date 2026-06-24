@@ -135,16 +135,11 @@ export function useGraphFocus(
   ego:            Record<string, EgoPartner[]>,
   selectedColors: Set<string>,
   colorMode:      'including' | 'exactly',
+  nameToIdx:      Record<string, number>,
 ) {
   const [focusedIdx,      setFocusedIdx]      = useState<number | null>(null);
   const [focusData,       setFocusData]       = useState<FocusData | null>(null);
   const [focusDataFormat, setFocusDataFormat] = useState<string | null>(null);
-
-  const nameToIdx = useMemo<Record<string, number>>(() => {
-    const m: Record<string, number> = {};
-    nodes.forEach((n, i) => { m[n.name] = i; });
-    return m;
-  }, [nodes]);
 
   // Recomputes whenever focusedIdx, filter, or the underlying data changes.
   const focusGraphData = useMemo<FocusGraphData | null>(() => {

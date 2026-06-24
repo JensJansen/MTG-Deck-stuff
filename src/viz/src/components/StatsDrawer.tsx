@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import type { CardNode, EgoPartner } from '../types';
 import './StatsDrawer.css';
 
@@ -21,6 +21,7 @@ function liftColor(lift: number): string {
 export function StatsDrawer({ open, node, partners, onClose, onNodeClick }: Props) {
   const [sortCol, setSortCol] = useState<SortCol>('c');
   const [sortAsc, setSortAsc] = useState(false);
+  useEffect(() => { setSortCol('c'); setSortAsc(false); }, [node?.name]);
 
   const sorted = useMemo(() => [...partners].sort((a, b) => {
     const av = a[sortCol], bv = b[sortCol];

@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef } from 'react';
+import { useState, useMemo, useRef, useEffect } from 'react';
 import { COLOR_HEX, COLOR_LABEL, COLOR_ORDER } from './constants';
 import { useManifest, useGraphData, useArchetypeData } from './hooks/useGraphData';
 import { useGraphFocus } from './hooks/useGraphFocus';
@@ -34,21 +34,9 @@ export function App() {
   const { data, loading: dataLoading, error } = useGraphData(selectedFormat);
 
   const hasArchetypes = archetypeFormats.includes(selectedFormat ?? '');
-  const { data: archetypeData, loading: archetypeLoading } = useArchetypeData(
+  const { data: archetypeData, loading: archetypeLoading, error: archetypeError } = useArchetypeData(
     hasArchetypes ? selectedFormat : null
   );
-
-  const { focusedNode, isFocused, focusGraphData, applyFocus, resetFocus } =
-    useGraphFocus(data?.nodes ?? [], data?.edges ?? [], selectedFormat, data?.ego ?? {}, selectedColors, colorMode);
-
-
-  const [focusPill, setFocusPill] = useState<string | null>(null);
-  const pillTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  function showPill(text: string) {
-    if (pillTimer.current) clearTimeout(pillTimer.current);
-    setFocusPill(text);
-    pillTimer.current = setTimeout(() => setFocusPill(null), 5000);
-  }
 
   const nameIndex = useMemo<Record<string, number>>(() => {
     if (!data) return {};
@@ -56,6 +44,18 @@ export function App() {
     data.nodes.forEach((n, i) => { idx[n.name] = i; });
     return idx;
   }, [data]);
+
+  const { focusedNode, isFocused, focusGraphData, applyFocus, resetFocus } =
+    useGraphFocus(data?.nodes ?? [], data?.edges ?? [], selectedFormat, data?.ego ?? {}, selectedColors, colorMode, nameIndex);
+
+  const [focusPill, setFocusPill] = useState<string | null>(null);
+  const pillTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (pillTimer.current) clearTimeout(pillTimer.current); }, []);
+  function showPill(text: string) {
+    if (pillTimer.current) clearTimeout(pillTimer.current);
+    setFocusPill(text);
+    pillTimer.current = setTimeout(() => setFocusPill(null), 5000);
+  }
 
   const highlightedIndices = useMemo<number[] | null>(() => {
     if (!searchQuery || !data) return null;
@@ -168,7 +168,7 @@ export function App() {
                 selectedId={selectedArchetypeId}
               />
             ) : (
-              <LoadingScreen label="No archetype data — run precompute_archetypes.py first." />
+              <LoadingScreen label={archetypeError ?? 'No archetype data — run precompute_archetypes.py first.'} />
             )
           )}
 
@@ -266,21 +266,23 @@ export function App() {
         </div>
       </div>
 
-      {/* Right panels (outside app-main, always mounted) */}
-      <EgoPanel node={selectedNode} partners={partners} nameIndex={nameIndex} nodes={data.nodes}
-        onClose={handlePanelClose}
-        onRefocus={() => {
-          if (selectedNodeIdx !== null) {
-            showPill('Loading focus view…');
-            applyFocus(selectedNodeIdx).catch((e: unknown) => {
-              console.error('applyFocus failed:', e);
-              showPill('Failed to load focus data');
-            });
-          }
-        }}
-        onViewStats={() => setDrawerOpen(true)}
-        onNodeClick={handlePartnerClick}
-      />
+      {/* Right panel — only mounted when a node is selected */}
+      {selectedNode && (
+        <EgoPanel node={selectedNode} partners={partners} nameIndex={nameIndex} nodes={data.nodes}
+          onClose={handlePanelClose}
+          onRefocus={() => {
+            if (selectedNodeIdx !== null) {
+              showPill('Loading focus view…');
+              applyFocus(selectedNodeIdx).catch((e: unknown) => {
+                console.error('applyFocus failed:', e);
+                showPill('Failed to load focus data');
+              });
+            }
+          }}
+          onViewStats={() => setDrawerOpen(true)}
+          onNodeClick={handlePartnerClick}
+        />
+      )}
 
       {focusPill && <div className="focus-toast">{focusPill}</div>}
 

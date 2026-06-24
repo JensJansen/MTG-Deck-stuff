@@ -7,6 +7,18 @@ import './ForceGraph.css';
 
 try { Cytoscape.use(fcose); } catch { /* already registered by FocusGraph */ }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const STYLESHEET: any[] = [
+  { selector: 'node',             style: { 'shape': 'ellipse', 'background-color': 'data(color)', 'width': 'data(size)', 'height': 'data(size)', 'label': '', 'cursor': 'pointer', 'overlay-opacity': 0, 'text-background-opacity': 0, 'opacity': 0.85 } },
+  { selector: 'node:active',      style: { 'overlay-opacity': 0 } },
+  { selector: 'node:hover',       style: { 'label': 'data(label)', 'font-size': 11, 'color': '#e0e0e0', 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4, 'opacity': 1, 'text-background-color': '#0d1117', 'text-background-opacity': 0.75, 'text-background-padding': '2px' } },
+  { selector: 'node.labeled',     style: { 'label': 'data(label)', 'font-size': 9, 'color': '#aaaaaa', 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4, 'text-background-color': '#0d1117', 'text-background-opacity': 0.75, 'text-background-padding': '2px' } },
+  { selector: 'node.highlighted', style: { 'label': 'data(label)', 'font-size': 10, 'color': '#ffffff', 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4, 'border-width': 2, 'border-color': '#ffffff', 'opacity': 1, 'text-background-color': '#0d1117', 'text-background-opacity': 0.75, 'text-background-padding': '2px' } },
+  { selector: 'node.dimmed',      style: { 'opacity': 0.07, 'label': '' } },
+  { selector: 'edge',             style: { 'width': 'data(width)', 'line-color': '#ffffff', 'opacity': 'data(opacity)', 'curve-style': 'straight', 'overlay-opacity': 0 } },
+  { selector: 'edge.dimmed',      style: { 'opacity': 0.02 } },
+];
+
 interface Props {
   nodes:              CardNode[];
   edges:              [number, number, number][];
@@ -133,24 +145,12 @@ export function ForceGraph({
       return { data: { id: `e${idx}`, source: String(a), target: String(b), width: edgeWidth(jac), opacity: edgeOpacity(jac), jaccard: jac } };
     });
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const stylesheet: any[] = [
-      { selector: 'node',             style: { 'shape': 'ellipse', 'background-color': 'data(color)', 'width': 'data(size)', 'height': 'data(size)', 'label': '', 'cursor': 'pointer', 'overlay-opacity': 0, 'text-background-opacity': 0, 'opacity': 0.85 } },
-      { selector: 'node:active',      style: { 'overlay-opacity': 0 } },
-      { selector: 'node:hover',       style: { 'label': 'data(label)', 'font-size': 11, 'color': '#e0e0e0', 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4, 'opacity': 1, 'text-background-color': '#0d1117', 'text-background-opacity': 0.75, 'text-background-padding': '2px' } },
-      { selector: 'node.labeled',     style: { 'label': 'data(label)', 'font-size': 9, 'color': '#aaaaaa', 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4, 'text-background-color': '#0d1117', 'text-background-opacity': 0.75, 'text-background-padding': '2px' } },
-      { selector: 'node.highlighted', style: { 'label': 'data(label)', 'font-size': 10, 'color': '#ffffff', 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4, 'border-width': 2, 'border-color': '#ffffff', 'opacity': 1, 'text-background-color': '#0d1117', 'text-background-opacity': 0.75, 'text-background-padding': '2px' } },
-      { selector: 'node.dimmed',      style: { 'opacity': 0.07, 'label': '' } },
-      { selector: 'edge',             style: { 'width': 'data(width)', 'line-color': '#ffffff', 'opacity': 'data(opacity)', 'curve-style': 'straight', 'overlay-opacity': 0 } },
-      { selector: 'edge.dimmed',      style: { 'opacity': 0.02 } },
-    ];
-
     if (cyRef.current) { cyRef.current.destroy(); cyRef.current = null; }
 
     const cy = Cytoscape({
       container,
       elements: [...cyNodes, ...cyEdges],
-      style: stylesheet,
+      style: STYLESHEET,
       layout: { name: 'preset' },
       autoungrabify: true,
     });

@@ -5,7 +5,7 @@ import type { CardNode, EgoPartner } from '../types';
 import './EgoPanel.css';
 
 interface Props {
-  node: CardNode | null;
+  node: CardNode;
   partners: EgoPartner[];
   nameIndex: Record<string, number>;
   nodes: CardNode[];
@@ -18,8 +18,6 @@ interface Props {
 export function EgoPanel({ node, partners, nameIndex, nodes, onClose, onRefocus, onViewStats, onNodeClick }: Props) {
   const [showFullCard, setShowFullCard] = useState(false);
   useEffect(() => { setShowFullCard(false); }, [node]);
-
-  if (!node) return null;
 
   return (
     <div className="ego-panel panel-slide open">

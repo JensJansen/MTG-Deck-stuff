@@ -2,6 +2,7 @@ import { useMemo, useEffect, useRef } from 'react';
 import * as d3 from 'd3';
 import { COLOR_HEX, COLOR_LABEL, COLOR_BITS, COLOR_ORDER } from '../constants';
 import type { CardNode, ColorCat, ArchetypeData, ArchetypeNode } from '../types';
+import { archetypeLabel } from './ArchetypeView';
 import './ColorsView.css';
 
 const MONO   = ['W', 'U', 'B', 'R', 'G'] as const;
@@ -336,14 +337,6 @@ function InclusionBoxPlots({ data }: { data: InclDist[] }) {
 
 // ── Archetype color bars ──────────────────────────────────────────────────────
 
-function archLabel(a: ArchetypeNode): string {
-  if (a.name) return a.name;
-  const cards = a.top_cards;
-  if (cards && cards.length >= 2) return `${cards[0].card} · ${cards[1].card}`;
-  if (cards && cards.length === 1) return cards[0].card;
-  return `Archetype ${a.id}`;
-}
-
 function ArchetypeColorBars({ archetypes }: { archetypes: ArchetypeNode[] }) {
   return (
     <div className="cv-card cv-archbars-card">
@@ -354,7 +347,7 @@ function ArchetypeColorBars({ archetypes }: { archetypes: ArchetypeNode[] }) {
           const profile = arch.color_profile!;
           return (
             <div key={arch.id} className="cv-arch-row">
-              <div className="cv-arch-label" title={archLabel(arch)}>{archLabel(arch)}</div>
+              <div className="cv-arch-label" title={archetypeLabel(arch)}>{archetypeLabel(arch)}</div>
               <div className="cv-arch-bar-wrap">
                 <div className="cv-arch-bar" style={{ width: '100%' }}>
                   {MONO.map(c => {
