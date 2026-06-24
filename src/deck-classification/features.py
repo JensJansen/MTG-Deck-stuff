@@ -40,17 +40,15 @@ from config import (
     PIP_COLORS,
 )
 
+sys.path.insert(0, str(Path(__file__).parents[1]))
+from constants.mtg import format_to_table_prefix
+
 # Import DeckTransformer and vocabulary from the sibling deck-builder package.
 sys.path.insert(0, str(Path(__file__).parents[1] / "deck-builder"))
 
 _PIP_RE = re.compile(r'\{([WUBRG])\}')
 
-_FORMAT_TABLE: dict[str, str] = {"highlanderCanadian": "canadian_highlander"}
 _SINGLETON_FORMATS = frozenset(["commander", "highlanderCanadian"])
-
-
-def _table_prefix(fmt: str) -> str:
-    return _FORMAT_TABLE.get(fmt, fmt)
 
 
 # ── Pip volume ─────────────────────────────────────────────────────────────────
@@ -67,11 +65,29 @@ def _parse_pips(mana_cost: str | None) -> list[int]:
 
 # ── Database queries ───────────────────────────────────────────────────────────
 
-def load_deck_ids(conn, fmt: str) -> list[str]:
-    prefix = _table_prefix(fmt)
+def load_deck_ids(conn, fmt: str, color_mask: int | None = None) -> list[str]:
+    prefix = format_to_table_prefix(fmt)
+    with conn.cursor() as cur:
+        if color_mask is not None:
+            cur.execute(
+                f"SELECT public_id FROM {prefix}_decks"
+                f" WHERE status = 'done' AND color_mask = %s ORDER BY public_id",
+                (color_mask,),
+            )
+        else:
+            cur.execute(
+                f"SELECT public_id FROM {prefix}_decks WHERE status = 'done' ORDER BY public_id",
+            )
+        return [row[0] for row in cur.fetchall()]
+
+
+def load_color_masks(conn, fmt: str) -> list[int]:
+    """Return sorted list of distinct color_mask values present in done decks."""
+    prefix = format_to_table_prefix(fmt)
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT public_id FROM {prefix}_decks WHERE status = 'done' ORDER BY public_id",
+            f"SELECT DISTINCT color_mask FROM {prefix}_decks"
+            f" WHERE status = 'done' AND color_mask IS NOT NULL ORDER BY color_mask",
         )
         return [row[0] for row in cur.fetchall()]
 
@@ -81,15 +97,15 @@ def _load_card_data(conn, fmt: str) -> dict[str, dict]:
     Returns {card_name: {mana_cost, cmc}} for all non-land cards
     appearing in done decks of the given format.
     """
-    prefix = _table_prefix(fmt)
+    prefix = format_to_table_prefix(fmt)
     if fmt in _SINGLETON_FORMATS:
         sql = f"""
             SELECT DISTINCT c.card_name, c.mana_cost, c.cmc
             FROM {prefix}_decks d
-            CROSS JOIN LATERAL jsonb_array_elements(d.cards) AS elem
-            JOIN cards c ON c.card_name = elem->>'card_name'
-            WHERE d.status  = 'done'
-              AND d.cards   IS NOT NULL
+            CROSS JOIN LATERAL unnest(d.card_ids) AS cid
+            JOIN cards c ON c.id = cid
+            WHERE d.status   = 'done'
+              AND d.card_ids IS NOT NULL
               AND c.type_line NOT LIKE '%%Land%%'
         """
     else:
@@ -112,15 +128,15 @@ def _stream_deck_cards(conn, fmt: str):
     Yields (public_id, card_name) for all non-land mainboard cards in done
     decks of the given format, ordered by public_id.
     """
-    prefix = _table_prefix(fmt)
+    prefix = format_to_table_prefix(fmt)
     if fmt in _SINGLETON_FORMATS:
         sql = f"""
             SELECT d.public_id, c.card_name
             FROM {prefix}_decks d
-            CROSS JOIN LATERAL jsonb_array_elements(d.cards) AS elem
-            JOIN cards c ON c.card_name = elem->>'card_name'
-            WHERE d.status  = 'done'
-              AND d.cards   IS NOT NULL
+            CROSS JOIN LATERAL unnest(d.card_ids) AS cid
+            JOIN cards c ON c.id = cid
+            WHERE d.status   = 'done'
+              AND d.card_ids IS NOT NULL
               AND c.type_line NOT LIKE '%%Land%%'
             ORDER BY d.public_id
         """
@@ -146,15 +162,15 @@ def _stream_deck_cards_with_qty(conn, fmt: str):
     Yields (public_id, card_name, quantity) for all non-land mainboard cards.
     Singleton formats always yield quantity=1.
     """
-    prefix = _table_prefix(fmt)
+    prefix = format_to_table_prefix(fmt)
     if fmt in _SINGLETON_FORMATS:
         sql = f"""
             SELECT d.public_id, c.card_name, 1
             FROM {prefix}_decks d
-            CROSS JOIN LATERAL jsonb_array_elements(d.cards) AS elem
-            JOIN cards c ON c.card_name = elem->>'card_name'
-            WHERE d.status  = 'done'
-              AND d.cards   IS NOT NULL
+            CROSS JOIN LATERAL unnest(d.card_ids) AS cid
+            JOIN cards c ON c.id = cid
+            WHERE d.status   = 'done'
+              AND d.card_ids IS NOT NULL
               AND c.type_line NOT LIKE '%%Land%%'
             ORDER BY d.public_id
         """
@@ -221,6 +237,70 @@ def compute_structural_features(
     cmc_dists = cmc_sums / cmc_totals
 
     return pip_volumes.astype(np.float32), cmc_dists.astype(np.float32)
+
+
+def compute_all_features(
+    deck_ids: list[str],
+    conn,
+    fmt: str,
+) -> tuple[np.ndarray, np.ndarray, sp.csr_matrix, sp.csr_matrix, list[str]]:
+    """
+    Single-pass replacement for calling compute_structural_features then
+    compute_card_presence separately.  Streams deck-card data once and builds
+    all five outputs: pip_volumes, cmc_dists, presence, counts, card_vocab.
+    """
+    card_data  = _load_card_data(conn, fmt)
+    id_to_idx  = {did: i for i, did in enumerate(deck_ids)}
+    N          = len(deck_ids)
+    n_cmc_bins = len(CMC_BINS) + 1
+
+    pip_sums    = np.zeros((N, len(PIP_COLORS)), dtype=np.float32)
+    cmc_sums    = np.zeros((N, n_cmc_bins),      dtype=np.float32)
+    card_index: dict[str, int] = {}
+    rows_arr    = array.array('i')
+    cols_arr    = array.array('i')
+    qtys_arr    = array.array('f')
+
+    print("  Computing structural features + presence matrix (single pass)...")
+    for deck_id, card_name, qty in tqdm(
+        _stream_deck_cards_with_qty(conn, fmt), desc="  All features"
+    ):
+        row = id_to_idx.get(deck_id)
+        if row is None:
+            continue
+
+        info = card_data.get(card_name)
+        if info:
+            pip_sums[row] += _parse_pips(info["mana_cost"])
+            cmc = int(info["cmc"])
+            cmc_sums[row, min(cmc, n_cmc_bins - 1)] += 1
+
+        if card_name not in card_index:
+            card_index[card_name] = len(card_index)
+        col = card_index[card_name]
+        rows_arr.append(row)
+        cols_arr.append(col)
+        qtys_arr.append(float(qty))
+
+    norms = np.linalg.norm(pip_sums, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    pip_volumes = (pip_sums / norms).astype(np.float32)
+
+    cmc_totals = cmc_sums.sum(axis=1, keepdims=True)
+    cmc_totals[cmc_totals == 0] = 1.0
+    cmc_dists = (cmc_sums / cmc_totals).astype(np.float32)
+
+    V         = len(card_index)
+    bool_data = np.ones(len(rows_arr), dtype=np.bool_)
+    presence  = sp.csr_matrix((bool_data, (rows_arr, cols_arr)), shape=(N, V))
+    qty_data  = np.array(qtys_arr, dtype=np.float32)
+    counts    = sp.csr_matrix((qty_data, (rows_arr, cols_arr)), shape=(N, V))
+
+    card_vocab = [None] * V
+    for name, idx in card_index.items():
+        card_vocab[idx] = name
+
+    return pip_volumes, cmc_dists, presence, counts, card_vocab
 
 
 def compute_card_presence(
@@ -320,27 +400,34 @@ def compute_embeddings(
 
 # ── Cache helpers ──────────────────────────────────────────────────────────────
 
-def _cache_path(fmt: str, suffix: str) -> str:
-    return os.path.join(DATA_DIR, f"{suffix}_{fmt}.npz")
+def _cache_path(fmt: str, suffix: str, color_mask: int | None = None) -> str:
+    tag = f"_{color_mask}" if color_mask is not None else ""
+    return os.path.join(DATA_DIR, f"{suffix}_{fmt}{tag}.npz")
 
 
-def save_structural(fmt: str, deck_ids: list[str], pip_volumes: np.ndarray, cmc_dists: np.ndarray) -> None:
+def save_structural(
+    fmt: str, deck_ids: list[str], pip_volumes: np.ndarray, cmc_dists: np.ndarray,
+    color_mask: int | None = None,
+) -> None:
     np.savez_compressed(
-        _cache_path(fmt, "features"),
+        _cache_path(fmt, "features", color_mask),
         deck_ids=np.array(deck_ids),
         pip_volumes=pip_volumes,
         cmc_dists=cmc_dists,
     )
 
 
-def load_structural(fmt: str) -> tuple[list[str], np.ndarray, np.ndarray]:
-    data = np.load(_cache_path(fmt, "features"), allow_pickle=True)
+def load_structural(fmt: str, color_mask: int | None = None) -> tuple[list[str], np.ndarray, np.ndarray]:
+    data = np.load(_cache_path(fmt, "features", color_mask), allow_pickle=True)
     return list(data["deck_ids"]), data["pip_volumes"], data["cmc_dists"]
 
 
-def save_presence(fmt: str, deck_ids: list[str], matrix: sp.csr_matrix, counts: sp.csr_matrix, card_vocab: list[str]) -> None:
+def save_presence(
+    fmt: str, deck_ids: list[str], matrix: sp.csr_matrix, counts: sp.csr_matrix,
+    card_vocab: list[str], color_mask: int | None = None,
+) -> None:
     np.savez_compressed(
-        _cache_path(fmt, "presence"),
+        _cache_path(fmt, "presence", color_mask),
         deck_ids=np.array(deck_ids),
         card_vocab=np.array(card_vocab),
         data=matrix.data,
@@ -353,8 +440,8 @@ def save_presence(fmt: str, deck_ids: list[str], matrix: sp.csr_matrix, counts: 
     )
 
 
-def load_presence(fmt: str) -> tuple[list[str], sp.csr_matrix, sp.csr_matrix | None, list[str]]:
-    d   = np.load(_cache_path(fmt, "presence"), allow_pickle=True)
+def load_presence(fmt: str, color_mask: int | None = None) -> tuple[list[str], sp.csr_matrix, sp.csr_matrix | None, list[str]]:
+    d   = np.load(_cache_path(fmt, "presence", color_mask), allow_pickle=True)
     mat = sp.csr_matrix((d["data"], d["indices"], d["indptr"]), shape=tuple(d["shape"]))
     if "count_data" in d:
         counts = sp.csr_matrix(
@@ -362,26 +449,26 @@ def load_presence(fmt: str) -> tuple[list[str], sp.csr_matrix, sp.csr_matrix | N
             shape=tuple(d["shape"]),
         )
     else:
-        counts = None  # old cache without quantity data
+        counts = None
     return list(d["deck_ids"]), mat, counts, list(d["card_vocab"])
 
 
-def save_embeddings(fmt: str, deck_ids: list[str], embeddings: np.ndarray) -> None:
+def save_embeddings(fmt: str, deck_ids: list[str], embeddings: np.ndarray, color_mask: int | None = None) -> None:
     np.savez_compressed(
-        _cache_path(fmt, "embeddings"),
+        _cache_path(fmt, "embeddings", color_mask),
         deck_ids=np.array(deck_ids),
         embeddings=embeddings,
     )
 
 
-def load_embeddings(fmt: str) -> tuple[list[str], np.ndarray]:
-    data = np.load(_cache_path(fmt, "embeddings"), allow_pickle=True)
+def load_embeddings(fmt: str, color_mask: int | None = None) -> tuple[list[str], np.ndarray]:
+    data = np.load(_cache_path(fmt, "embeddings", color_mask), allow_pickle=True)
     return list(data["deck_ids"]), data["embeddings"]
 
 
-def cache_exists(fmt: str) -> dict[str, bool]:
+def cache_exists(fmt: str, color_mask: int | None = None) -> dict[str, bool]:
     return {
-        "embeddings": os.path.exists(_cache_path(fmt, "embeddings")),
-        "features":   os.path.exists(_cache_path(fmt, "features")),
-        "presence":   os.path.exists(_cache_path(fmt, "presence")),
+        "embeddings": os.path.exists(_cache_path(fmt, "embeddings", color_mask)),
+        "features":   os.path.exists(_cache_path(fmt, "features",   color_mask)),
+        "presence":   os.path.exists(_cache_path(fmt, "presence",   color_mask)),
     }

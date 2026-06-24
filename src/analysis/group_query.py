@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import psycopg2
 
 from constants.env import load_env
-from constants.moxfield import REGULAR_FORMATS
+from constants.mtg import REGULAR_FORMATS
 from query import SORT_CHOICES, resolve_card_name
 
 DEFAULT_LIMIT = 30

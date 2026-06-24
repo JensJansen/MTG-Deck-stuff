@@ -34,13 +34,7 @@ import umap
 from scipy.sparse import csr_matrix
 
 from constants.env import load_env
-from constants.moxfield import encode_colors, ALL_FORMATS, REGULAR_FORMATS
-
-_FORMAT_TABLE: dict[str, str] = {"highlanderCanadian": "canadian_highlander"}
-
-
-def _table_prefix(fmt: str) -> str:
-    return _FORMAT_TABLE.get(fmt, fmt)
+from constants.mtg import encode_colors, ALL_FORMATS, REGULAR_FORMATS, format_to_table_prefix
 
 OUTPUT_DIR = Path(__file__).parent / "public" / "data"
 
@@ -68,7 +62,7 @@ def get_formats(conn, fmt_filter: str | None) -> list[str]:
     fmts = [fmt_filter] if fmt_filter else list(ALL_FORMATS)
     result = []
     for fmt in fmts:
-        prefix = _table_prefix(fmt)
+        prefix = format_to_table_prefix(fmt)
         with conn.cursor() as cur:
             cur.execute(f"SELECT EXISTS(SELECT 1 FROM {prefix}_card_stats LIMIT 1)")
             if cur.fetchone()[0]:
@@ -283,7 +277,7 @@ def write_manifest(output_dir: Path, formats: list[str]) -> None:
 def run(conn, formats: list[str], min_decks: int, min_cooccur: int) -> list[str]:
     exported = []
     for fmt in formats:
-        prefix = _table_prefix(fmt)
+        prefix = format_to_table_prefix(fmt)
         print(f"\n[{fmt}]")
         if build_layout(conn, prefix, min_decks, min_cooccur):
             export_format(conn, fmt, prefix, OUTPUT_DIR)

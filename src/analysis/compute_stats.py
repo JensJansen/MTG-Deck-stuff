@@ -33,15 +33,9 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import psycopg2
 
 from constants.env import load_env
-from constants.moxfield import ALL_FORMATS, REGULAR_FORMATS, SINGLETON_FORMATS
+from constants.mtg import ALL_FORMATS, REGULAR_FORMATS, SINGLETON_FORMATS, format_to_table_prefix
 
 DEFAULT_MIN_COOCCUR = 5
-
-_FORMAT_TABLE: dict[str, str] = {"highlanderCanadian": "canadian_highlander"}
-
-
-def _table_prefix(fmt: str) -> str:
-    return _FORMAT_TABLE.get(fmt, fmt)
 
 
 def get_formats(fmt_filter: str | None) -> list[str]:
@@ -58,7 +52,7 @@ _SAMPLE_LIMIT = 5
 
 
 def _print_sample(conn, fmt: str, limit: int = _SAMPLE_LIMIT) -> None:
-    table = _table_prefix(fmt) + "_card_pair_stats"
+    table = format_to_table_prefix(fmt) + "_card_pair_stats"
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT card_a, card_b, cooccurrence_count, lift, jaccard
@@ -81,7 +75,7 @@ def _print_sample(conn, fmt: str, limit: int = _SAMPLE_LIMIT) -> None:
 def run(conn, formats: list[str], min_cooccur: int) -> None:
     for fmt in formats:
         print(f"\n[{fmt}]", flush=True)
-        prefix = _table_prefix(fmt)
+        prefix = format_to_table_prefix(fmt)
 
         with conn.cursor() as cur:
             if fmt in SINGLETON_FORMATS:

@@ -9,6 +9,7 @@ The full result of a pipeline run is passed as two structures:
 Existing rows for the same format and run_id are replaced so the pipeline
 can be re-run safely without accumulating stale data.
 """
+import io
 import sys
 from pathlib import Path
 
@@ -25,15 +26,23 @@ def _centroid_to_bytes(centroid: np.ndarray | None) -> bytes | None:
     return centroid.astype(np.float32).tobytes()
 
 
-def clear_format(conn, fmt: str) -> None:
+def clear_format(conn, fmt: str, color_mask: int | None = None) -> None:
     """
-    Remove all archetype records for a format before writing fresh ones.
-    Cascades to deck_archetypes via the FK on archetype_id.
+    Remove archetype records before writing fresh ones.
+    When color_mask is provided only that partition is cleared, leaving other
+    color-identity partitions untouched.  Cascades to deck_archetypes via FK.
     Does NOT commit — callers own the transaction.
     """
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM archetypes WHERE format = %s", (fmt,))
-    print(f"  Cleared existing archetypes for format={fmt!r}")
+        if color_mask is not None:
+            cur.execute(
+                "DELETE FROM archetypes WHERE format = %s AND color_mask = %s",
+                (fmt, color_mask),
+            )
+            print(f"  Cleared archetypes for format={fmt!r} color_mask={color_mask}")
+        else:
+            cur.execute("DELETE FROM archetypes WHERE format = %s", (fmt,))
+            print(f"  Cleared archetypes for format={fmt!r}")
 
 
 def write_archetypes(
@@ -41,6 +50,7 @@ def write_archetypes(
     fmt: str,
     run_id: str,
     records: list[dict],
+    color_mask: int | None = None,
 ) -> dict[tuple[int, int], int]:
     """
     Insert archetype rows and return a mapping of
@@ -71,6 +81,7 @@ def write_archetypes(
                 parent_db = local_to_db.get((1, r["parent_local"]))
             rows.append((
                 fmt,
+                color_mask,
                 level,
                 parent_db,
                 _centroid_to_bytes(r.get("centroid")),
@@ -83,15 +94,13 @@ def write_archetypes(
             ))
 
         with conn.cursor() as cur:
-            # execute_values(fetch=True) returns accumulated RETURNING results
-            # across all pages internally — do NOT call cur.fetchall() after it.
             db_ids = [
                 row[0]
                 for row in psycopg2.extras.execute_values(
                     cur,
                     """
                     INSERT INTO archetypes
-                        (format, level, parent_id, centroid, keystone_cards,
+                        (format, color_mask, level, parent_id, centroid, keystone_cards,
                          top_cards, color_profile, cmc_curve, member_count, run_id)
                     VALUES %s
                     RETURNING id
@@ -111,26 +120,36 @@ def write_archetypes(
 def write_assignments(
     conn,
     assignments: list[tuple[str, int, int, float]],
-    batch_size: int = 5_000,
+    chunk_size: int = 200_000,
 ) -> None:
     """
-    Upsert deck → archetype assignments.
+    Bulk-load deck → archetype assignments via COPY.
+
+    clear_format() cascades a DELETE to deck_archetypes before this is called,
+    so the table is empty for this format and COPY is safe (no conflicts).
 
     assignments: [(deck_id, archetype_db_id, level, confidence), ...]
     """
+    total = 0
     with conn.cursor() as cur:
-        for i in range(0, len(assignments), batch_size):
-            batch = assignments[i : i + batch_size]
-            psycopg2.extras.execute_values(
-                cur,
-                """
-                INSERT INTO deck_archetypes (deck_id, archetype_id, level, confidence)
-                VALUES %s
-                ON CONFLICT (deck_id, level) DO UPDATE
-                    SET archetype_id  = EXCLUDED.archetype_id,
-                        confidence    = EXCLUDED.confidence,
-                        classified_at = NOW()
-                """,
-                batch,
+        buf = io.StringIO()
+        for deck_id, archetype_db_id, level, confidence in assignments:
+            conf = f"{round(float(confidence), 6)}" if confidence is not None else r"\N"
+            buf.write(f"{deck_id}\t{archetype_db_id}\t{level}\t{conf}\n")
+            total += 1
+            if total % chunk_size == 0:
+                buf.seek(0)
+                cur.copy_expert(
+                    "COPY deck_archetypes (deck_id, archetype_id, level, confidence)"
+                    " FROM STDIN",
+                    buf,
+                )
+                buf = io.StringIO()
+        if buf.tell() > 0:
+            buf.seek(0)
+            cur.copy_expert(
+                "COPY deck_archetypes (deck_id, archetype_id, level, confidence)"
+                " FROM STDIN",
+                buf,
             )
-    print(f"  Wrote {len(assignments):,} deck assignments")
+    print(f"  Wrote {total:,} deck assignments")

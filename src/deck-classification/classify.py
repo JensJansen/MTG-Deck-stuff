@@ -29,12 +29,10 @@ import psycopg2
 sys.path.insert(0, str(Path(__file__).parent))
 from config import DATABASE_URL
 
-_FORMAT_TABLE: dict[str, str] = {"highlanderCanadian": "canadian_highlander"}
+sys.path.insert(0, str(Path(__file__).parents[1]))
+from constants.mtg import format_to_table_prefix
+
 _SINGLETON_FORMATS = frozenset(["commander", "highlanderCanadian"])
-
-
-def _table_prefix(fmt: str) -> str:
-    return _FORMAT_TABLE.get(fmt, fmt)
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
@@ -165,14 +163,14 @@ class DeckClassifier:
 
     def classify_deck_id(self, deck_id: str) -> dict:
         """Look up a deck from the DB by public_id and classify it."""
-        prefix = _table_prefix(self.fmt)
+        prefix = format_to_table_prefix(self.fmt)
         if self.fmt in _SINGLETON_FORMATS:
             with self._conn.cursor() as cur:
                 cur.execute(f"""
                     SELECT c.card_name
                     FROM {prefix}_decks d
-                    CROSS JOIN LATERAL jsonb_array_elements(d.cards) AS elem
-                    JOIN cards c ON c.card_name = elem->>'card_name'
+                    CROSS JOIN LATERAL unnest(d.card_ids) AS cid
+                    JOIN cards c ON c.id = cid
                     WHERE d.public_id = %s
                       AND c.type_line NOT LIKE '%%Land%%'
                 """, (deck_id,))

@@ -32,45 +32,56 @@ import level2
 import store
 from config import DATA_DIR, DATABASE_URL, MODEL_CHECKPOINT, PRESENCE_MAX_FREQ
 from constants.env import load_env
-from constants.moxfield import ALL_FORMATS
+from constants.mtg import ALL_FORMATS, SINGLETON_FORMATS
 
 
-def _compute_or_load_features(fmt: str, conn, recompute: bool):
+def _compute_or_load_features(fmt: str, conn, recompute: bool, color_mask: int | None = None):
     os.makedirs(DATA_DIR, exist_ok=True)
-    cached = feat.cache_exists(fmt)
+    cached     = feat.cache_exists(fmt, color_mask)
+    checkpoint = os.environ.get("MODEL_CHECKPOINT", MODEL_CHECKPOINT)
+
+    need_structural = recompute or not cached["features"]
+    need_presence   = recompute or not cached["presence"]
+    need_embeddings = bool(checkpoint) and (recompute or not cached["embeddings"])
+
+    # Always load deck_ids once — fast query, guarantees consistency across features.
+    deck_ids = feat.load_deck_ids(conn, fmt, color_mask)
 
     # ── Embeddings ─────────────────────────────────────────────────────────────
-    checkpoint = os.environ.get("MODEL_CHECKPOINT", MODEL_CHECKPOINT)
-    if checkpoint and (recompute or not cached["embeddings"]):
+    if need_embeddings:
         print("\n── Features: embeddings ──────────────────────────────────────────")
-        deck_ids   = feat.load_deck_ids(conn, fmt)
         embeddings = feat.compute_embeddings(deck_ids, conn, fmt, checkpoint)
-        feat.save_embeddings(fmt, deck_ids, embeddings)
+        feat.save_embeddings(fmt, deck_ids, embeddings, color_mask)
     elif cached["embeddings"]:
-        print(f"  Embeddings cache found → loading")
-        deck_ids, embeddings = feat.load_embeddings(fmt)
+        print("  Embeddings cache found → loading")
+        _, embeddings = feat.load_embeddings(fmt, color_mask)
     else:
         print("  No MODEL_CHECKPOINT set and no cached embeddings — using card presence only")
-        deck_ids   = feat.load_deck_ids(conn, fmt)
         embeddings = None
 
-    # ── Structural features (pip volume, CMC) ──────────────────────────────────
-    if recompute or not cached["features"]:
-        print("\n── Features: pip volumes + CMC distributions ─────────────────────")
-        pip_volumes, cmc_dists = feat.compute_structural_features(deck_ids, conn, fmt)
-        feat.save_structural(fmt, deck_ids, pip_volumes, cmc_dists)
+    # ── Structural + presence: single DB pass when both are needed ─────────────
+    if need_structural and need_presence:
+        print("\n── Features: structural + presence (single DB pass) ──────────────")
+        pip_volumes, cmc_dists, presence, counts, card_vocab = \
+            feat.compute_all_features(deck_ids, conn, fmt)
+        feat.save_structural(fmt, deck_ids, pip_volumes, cmc_dists, color_mask)
+        feat.save_presence(fmt, deck_ids, presence, counts, card_vocab, color_mask)
     else:
-        print(f"  Structural cache found → loading")
-        _, pip_volumes, cmc_dists = feat.load_structural(fmt)
+        if need_structural:
+            print("\n── Features: pip volumes + CMC distributions ─────────────────────")
+            pip_volumes, cmc_dists = feat.compute_structural_features(deck_ids, conn, fmt)
+            feat.save_structural(fmt, deck_ids, pip_volumes, cmc_dists, color_mask)
+        else:
+            print("  Structural cache found → loading")
+            _, pip_volumes, cmc_dists = feat.load_structural(fmt, color_mask)
 
-    # ── Card presence (sparse matrix) ──────────────────────────────────────────
-    if recompute or not cached["presence"]:
-        print("\n── Features: card presence matrix ────────────────────────────────")
-        presence, counts, card_vocab = feat.compute_card_presence(deck_ids, conn, fmt)
-        feat.save_presence(fmt, deck_ids, presence, counts, card_vocab)
-    else:
-        print(f"  Presence cache found → loading")
-        _, presence, counts, card_vocab = feat.load_presence(fmt)
+        if need_presence:
+            print("\n── Features: card presence matrix ────────────────────────────────")
+            presence, counts, card_vocab = feat.compute_card_presence(deck_ids, conn, fmt)
+            feat.save_presence(fmt, deck_ids, presence, counts, card_vocab, color_mask)
+        else:
+            print("  Presence cache found → loading")
+            _, presence, counts, card_vocab = feat.load_presence(fmt, color_mask)
 
     return deck_ids, embeddings, pip_volumes, cmc_dists, presence, counts, card_vocab
 
@@ -124,23 +135,24 @@ def _cmc_curve(cmc_dists: np.ndarray, indices: np.ndarray) -> list[float] | None
     return [round(float(v), 4) for v in cmc_dists[indices].mean(axis=0)]
 
 
-def run(fmt: str, recompute: bool = False) -> None:
+def run(fmt: str, recompute: bool = False, color_mask: int | None = None) -> None:
     load_env()
     db_url     = os.environ.get("DATABASE_URL", DATABASE_URL)
     run_id     = datetime.now(timezone.utc).isoformat()
     t_start    = time.monotonic()
     start_time = datetime.now()
-    print(f"Start:  {start_time.strftime('%Y-%m-%d %H:%M:%S')}  format={fmt}")
+    cm_label   = f"  color_mask={color_mask}" if color_mask is not None else ""
+    print(f"Start:  {start_time.strftime('%Y-%m-%d %H:%M:%S')}  format={fmt}{cm_label}")
 
     conn = psycopg2.connect(db_url)
 
     try:
         # ── 1. Features ────────────────────────────────────────────────────────
         deck_ids, embeddings, pip_volumes, cmc_dists, presence, counts, card_vocab = \
-            _compute_or_load_features(fmt, conn, recompute)
+            _compute_or_load_features(fmt, conn, recompute, color_mask)
 
         N = len(deck_ids)
-        print(f"\nFormat: {fmt}  |  {N:,} decks  |  {presence.shape[1]:,} unique non-land cards")
+        print(f"\nFormat: {fmt}{cm_label}  |  {N:,} decks  |  {presence.shape[1]:,} unique non-land cards")
 
         # ── Filter format staples from clustering input ────────────────────────
         # Cards present in > PRESENCE_MAX_FREQ of decks (e.g. Counterspell in blue
@@ -232,8 +244,8 @@ def run(fmt: str, recompute: bool = False) -> None:
         #       archetypes deleted without replacements being committed.
         print("\n── Storing results ───────────────────────────────────────────────")
         try:
-            store.clear_format(conn, fmt)
-            local_to_db = store.write_archetypes(conn, fmt, run_id, archetype_records)
+            store.clear_format(conn, fmt, color_mask)
+            local_to_db = store.write_archetypes(conn, fmt, run_id, archetype_records, color_mask)
 
             # Build assignment rows for every deck that received a label
             for global_idx, deck_id in enumerate(deck_ids):
@@ -278,7 +290,10 @@ def main() -> None:
     parser.add_argument("--format", "-f", required=True,
                         help=f"MTG format. Choices: {', '.join(ALL_FORMATS)}")
     parser.add_argument("--recompute-features", action="store_true",
-                        help="Re-extract all features from DB even if cache exists")
+                        help="Re-extract all features from DB even if cache exists.")
+    parser.add_argument("--color-mask", dest="color_mask", type=int, default=None,
+                        help="Run a single color-identity partition (0-31). "
+                             "Singleton formats only. Omit to run all partitions.")
     args = parser.parse_args()
 
     if args.format not in ALL_FORMATS:
@@ -286,7 +301,20 @@ def main() -> None:
         print(f"  Supported: {', '.join(ALL_FORMATS)}")
         sys.exit(1)
 
-    run(args.format, recompute=args.recompute_features)
+    if args.format in SINGLETON_FORMATS:
+        if args.color_mask is not None:
+            run(args.format, recompute=args.recompute_features, color_mask=args.color_mask)
+        else:
+            load_env()
+            db_url = os.environ.get("DATABASE_URL", DATABASE_URL)
+            conn   = psycopg2.connect(db_url)
+            color_masks = feat.load_color_masks(conn, args.format)
+            conn.close()
+            print(f"Singleton format — running {len(color_masks)} color-identity partitions")
+            for cm in color_masks:
+                run(args.format, recompute=args.recompute_features, color_mask=cm)
+    else:
+        run(args.format, recompute=args.recompute_features)
 
 
 if __name__ == "__main__":

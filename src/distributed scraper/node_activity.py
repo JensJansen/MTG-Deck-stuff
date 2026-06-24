@@ -13,30 +13,16 @@ Usage:
 """
 
 import argparse
-from pathlib import Path
 import os
-
-# Load .env so DATABASE_URL is available (same loader convention as the rest).
-for _line in (Path(__file__).with_name(".env")).read_text().splitlines():
-    _line = _line.strip()
-    if _line and not _line.startswith("#") and "=" in _line:
-        _k, _, _v = _line.partition("=")
-        os.environ.setdefault(_k.strip(), _v.strip())
 
 import psycopg2
 
-FORMATS = ["commander", "highlanderCanadian", "pauper", "modern", "vintage", "legacy"]
-DECK_TABLES = {
-    "commander":          "commander_decks",
-    "highlanderCanadian": "canadian_highlander_decks",
-    "pauper":             "pauper_decks",
-    "modern":             "modern_decks",
-    "vintage":            "vintage_decks",
-    "legacy":             "legacy_decks",
-}
+from config import ALL_FORMATS, format_to_table_prefix
+from constants.env import load_env
 
 
 def main() -> None:
+    load_env()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--window", type=int, default=10, help="Active window in minutes (default 10).")
     args = ap.parse_args()
@@ -50,7 +36,7 @@ def main() -> None:
     # ---- Central / discovery nodes (card claims) ----------------------------
     print("\nCENTRAL (discovery) nodes - by format:")
     central_workers: set[str] = set()
-    for fmt in FORMATS:
+    for fmt in ALL_FORMATS:
         at = f"claimed_at_{fmt}"
         by = f"claimed_by_{fmt}"
         cur.execute(
@@ -75,7 +61,8 @@ def main() -> None:
     # ---- Scraper / fetch nodes (deck claims) --------------------------------
     print("\nSCRAPER (fetch) nodes - currently-claimed decks:")
     scraper_workers: set[str] = set()
-    for fmt, table in DECK_TABLES.items():
+    for fmt in ALL_FORMATS:
+        table = format_to_table_prefix(fmt) + "_decks"
         cur.execute(
             f"""
             SELECT claimed_by, COUNT(*), MAX(claimed_at)

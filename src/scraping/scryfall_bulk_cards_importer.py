@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 import psycopg2
 import psycopg2.extras
 
-from constants.moxfield import LEGAL_FORMATS, REGULAR_FORMATS, encode_colors
+from constants.mtg import LEGAL_FORMATS, REGULAR_FORMATS, encode_colors
 from constants.env import load_env
 from scryfall import ScryfallClient
 
