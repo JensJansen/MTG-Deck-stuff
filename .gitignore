@@ -1,13 +1,25 @@
 __pycache__/
+.pytest_cache/
 node_modules/
 dist/
 
-# Credentials
-src/distributed scraper/.env
+# Scratch directories
+scratch/
 
-# Generated / scraped data — rebuild locally
-src/viz/public/data/*.json
+# Credentials
+V2/src/distributed scraper/.env
+
+# V2 unknown-card review log (runtime-generated)
+V2/src/distributed scraper/logs/
 
 # Flyway — CLI binary and config (config contains DB credentials)
-src/database/flyway-cli/
-src/database/flyway.toml
+V2/src/migrations/flyway-cli/
+V2/src/migrations/flyway.toml
+
+# Generated / scraped data — rebuild locally
+V2/src/data/cache/
+
+# Temporary visualizations
+*.png
+
+*.npz

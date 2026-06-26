@@ -1,0 +1,16 @@
+# Build context is V2/. Keep only the node code + constants in the upload.
+# NOTE: every pattern here is space-free on purpose. Patterns that referenced the
+# "distributed scraper" directory (which contains a space) caused buildkit to
+# over-exclude and collapse the whole context, so we don't touch that path here —
+# the Dockerfile already copies exactly the node files it needs.
+
+# Heavy DB/seed assets — DB-only, never part of the node image.
+src/migrations
+src/scraping
+src/data
+
+# Caches, bytecode, secrets, runtime logs.
+**/__pycache__
+**/*.pyc
+**/.env
+**/logs

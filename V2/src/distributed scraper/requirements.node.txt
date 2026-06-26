@@ -1,0 +1,3 @@
+# The node reaches the private API (and Moxfield) through Tailscale's userspace
+# SOCKS5 proxy via ALL_PROXY, so requests needs SOCKS support.
+requests[socks]>=2.31.0

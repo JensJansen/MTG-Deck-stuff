@@ -1,0 +1,26 @@
+# Single V2 scraper node image. Build context is the V2/ directory.
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y curl && \
+    curl -fsSL https://tailscale.com/install.sh | sh && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY ["src/distributed scraper/requirements.node.txt", "."]
+RUN pip install --no-cache-dir -r requirements.node.txt
+
+# Node code only — the API/DB modules (api.py, db.py, cards.py) are not needed
+# here and are deliberately omitted to keep the image minimal.
+COPY ["src/distributed scraper/node.py", \
+      "src/distributed scraper/api_client.py", \
+      "src/distributed scraper/moxfield_client.py", \
+      "src/distributed scraper/ratelimiter.py", \
+      "src/distributed scraper/config.py", \
+      "./"]
+COPY ["src/distributed scraper/start.node.sh", "."]
+RUN chmod +x start.node.sh
+
+COPY src/constants/ ./constants/
+
+CMD ["./start.node.sh"]

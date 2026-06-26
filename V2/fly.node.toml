@@ -1,0 +1,29 @@
+app            = "deck-gen-v2-node"
+primary_region = "iad"
+
+# One unified deployable: scale horizontally with `fly scale count N` — each
+# machine is one node process (with its own IP, so the shared rate limiter keeps
+# every machine within Moxfield's per-IP budget). No central/scraper split.
+auto_stop_machines   = "off"
+auto_start_machines  = false
+min_machines_running = 1
+
+[build]
+  # This file lives at the build-context root (V2/), so both the dockerfile path
+  # and the Dockerfile's COPY paths are anchored at V2/ — no path can double.
+  # Deploy from V2/:  fly deploy --config fly.node.toml
+  dockerfile = "src/distributed scraper/Dockerfile.node"
+
+[env]
+  SCRAPER_API_URL  = "http://100.113.155.84:8000"   # central host API over Tailscale
+  ALL_PROXY        = "socks5h://127.0.0.1:1055"      # route via Tailscale userspace SOCKS proxy
+  PYTHONUNBUFFERED = "1"
+  NODE_WORKERS     = "24"                             # concurrent workers; tune to saturate 20 RPS
+
+# Secrets (never in this file) — set once with:
+#   fly secrets set API_KEY=...  TAILSCALE_AUTHKEY=...  -a deck-gen-v2-node
+
+[[vm]]
+  memory   = "256mb"
+  cpu_kind = "shared"
+  cpus     = 1
